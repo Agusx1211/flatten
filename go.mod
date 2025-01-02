@@ -1,4 +1,4 @@
-module flatten
+module github.com/agusx1211/flatten
 
 go 1.21
 
