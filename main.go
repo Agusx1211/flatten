@@ -23,6 +23,9 @@ type FileEntry struct {
 
 var includeGitIgnore bool
 var includeGit bool
+var toFile bool
+var fileName string
+var skipGitIgnoreAdd bool
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -131,15 +134,15 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool) string {
 }
 
 // printFlattenedOutput prints all files and their contents
-func printFlattenedOutput(entry *FileEntry) {
+func printFlattenedOutput(entry *FileEntry, w *strings.Builder) {
 	if !entry.IsDir {
-		fmt.Printf("\n- path: %s\n", entry.Path)
-		fmt.Printf("- content:\n```\n%s\n```\n", string(entry.Content))
+		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
+		w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
 		return
 	}
 
 	for _, child := range entry.Children {
-		printFlattenedOutput(child)
+		printFlattenedOutput(child, w)
 	}
 }
 
@@ -167,13 +170,35 @@ all subdirectories and their contents.`,
 			return fmt.Errorf("failed to load directory structure: %w", err)
 		}
 
-		// Print summary and directory tree
-		fmt.Printf("- Total files: %d\n", getTotalFiles(root))
-		fmt.Printf("- Total size: %d bytes\n", getTotalSize(root))
-		fmt.Printf("- Dir tree:\n%s\n", renderDirTree(root, "", false))
+		// Create a string builder for the output
+		var output strings.Builder
 
-		// Print flattened file contents
-		printFlattenedOutput(root)
+		// Write summary and directory tree
+		output.WriteString(fmt.Sprintf("- Total files: %d\n", getTotalFiles(root)))
+		output.WriteString(fmt.Sprintf("- Total size: %d bytes\n", getTotalSize(root)))
+		output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false)))
+
+		// Write flattened file contents
+		printFlattenedOutput(root, &output)
+
+		// Handle output based on flags
+		if toFile {
+			err := os.WriteFile(fileName, []byte(output.String()), 0644)
+			if err != nil {
+				return fmt.Errorf("failed to write to file: %w", err)
+			}
+			fmt.Printf("Output written to: %s\n", fileName)
+
+			// Add to .gitignore if appropriate
+			if !skipGitIgnoreAdd {
+				baseFileName := filepath.Base(fileName)
+				if err := filter.addToGitIgnore(baseFileName); err != nil {
+					return fmt.Errorf("failed to update .gitignore: %w", err)
+				}
+			}
+		} else {
+			fmt.Print(output.String())
+		}
 
 		return nil
 	},
@@ -182,6 +207,9 @@ all subdirectories and their contents.`,
 func init() {
 	rootCmd.Flags().BoolVar(&includeGitIgnore, "include-gitignore", false, "Include files that would normally be ignored by .gitignore")
 	rootCmd.Flags().BoolVar(&includeGit, "include-git", false, "Include .git directory and its contents")
+	rootCmd.Flags().BoolVar(&toFile, "tf", false, "Write output to file instead of stdout")
+	rootCmd.Flags().StringVar(&fileName, "fn", "./flat", "Output file name (only used with --tf)")
+	rootCmd.Flags().BoolVar(&skipGitIgnoreAdd, "skip-gitignore", false, "Skip adding output file to .gitignore")
 }
 
 func main() {

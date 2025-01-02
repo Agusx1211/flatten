@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,4 +74,54 @@ func (f *Filter) ShouldInclude(path string) bool {
 	relPath = filepath.ToSlash(relPath)
 
 	return !f.gitIgnore.MatchesPath(relPath)
+}
+
+func (f *Filter) addToGitIgnore(filename string) error {
+	gitIgnorePath := filepath.Join(f.baseDir, ".gitignore")
+
+	// Check if .gitignore exists
+	if _, err := os.Stat(gitIgnorePath); os.IsNotExist(err) {
+		// Create new .gitignore with the entry
+		content := fmt.Sprintf("# Output files from flatten tool\n%s\n", filename)
+		return os.WriteFile(gitIgnorePath, []byte(content), 0644)
+	}
+
+	// Check if the entry already exists
+	exists, err := f.checkGitIgnoreEntry(filename)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	// Append to existing .gitignore
+	file, err := os.OpenFile(gitIgnorePath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = fmt.Fprintf(file, "\n# Output file from flatten tool\n%s\n", filename)
+	return err
+}
+
+func (f *Filter) checkGitIgnoreEntry(filename string) (bool, error) {
+	gitIgnorePath := filepath.Join(f.baseDir, ".gitignore")
+
+	file, err := os.Open(gitIgnorePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == filename {
+			return true, nil
+		}
+	}
+
+	return false, scanner.Err()
 }
