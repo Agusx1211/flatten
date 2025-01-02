@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -26,6 +28,8 @@ var includeGit bool
 var toFile bool
 var fileName string
 var skipGitIgnoreAdd bool
+var autoDelete bool
+var autoDeleteTime int
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -146,6 +150,25 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder) {
 	}
 }
 
+func scheduleFileDelete(filePath string, seconds int) error {
+	// Get absolute path for the file
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	// Create the delete command that will run after N seconds
+	// Using full path for rm command and target file
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("sleep %d && rm %s", seconds, absPath))
+
+	// Detach the process
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	return cmd.Start()
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "flatten [directory]",
 	Short: "Flatten outputs a directory structure as a flat representation",
@@ -189,6 +212,14 @@ all subdirectories and their contents.`,
 			}
 			fmt.Printf("Output written to: %s\n", fileName)
 
+			// Add auto-delete if enabled
+			if autoDelete {
+				if err := scheduleFileDelete(fileName, autoDeleteTime); err != nil {
+					return fmt.Errorf("failed to schedule file deletion: %w", err)
+				}
+				fmt.Printf("File will be automatically deleted after %d seconds\n", autoDeleteTime)
+			}
+
 			// Add to .gitignore if appropriate
 			if !skipGitIgnoreAdd {
 				baseFileName := filepath.Base(fileName)
@@ -210,6 +241,8 @@ func init() {
 	rootCmd.Flags().BoolVar(&toFile, "tf", false, "Write output to file instead of stdout")
 	rootCmd.Flags().StringVar(&fileName, "fn", "./flat", "Output file name (only used with --tf)")
 	rootCmd.Flags().BoolVar(&skipGitIgnoreAdd, "skip-gitignore", false, "Skip adding output file to .gitignore")
+	rootCmd.Flags().BoolVar(&autoDelete, "ad", false, "Auto delete the output file after N seconds (only used with --tf)")
+	rootCmd.Flags().IntVar(&autoDeleteTime, "adt", 30, "Auto delete time in seconds (only used with --ad)")
 }
 
 func main() {

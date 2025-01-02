@@ -46,6 +46,9 @@ release/
 ehthumbs.db
 Thumbs.db
 
+# Flatten binary
+./flatten
+
 # Temporary files
 *.tmp
 *.temp
