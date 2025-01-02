@@ -14,20 +14,24 @@ import (
 
 // Filter handles file filtering logic
 type Filter struct {
-	gitIgnore  *ignore.GitIgnore
-	includeAll bool
-	includeGit bool
-	includeBin bool
-	baseDir    string
+	gitIgnore       *ignore.GitIgnore
+	includeAll      bool
+	includeGit      bool
+	includeBin      bool
+	baseDir         string
+	includePatterns []string
+	excludePatterns []string
 }
 
 // NewFilter creates a new filter for the given directory
-func NewFilter(dir string, includeGitIgnore bool, includeGit bool, includeBin bool) (*Filter, error) {
+func NewFilter(dir string, includeGitIgnore bool, includeGit bool, includeBin bool, includePatterns []string, excludePatterns []string) (*Filter, error) {
 	f := &Filter{
-		includeAll: includeGitIgnore,
-		includeGit: includeGit,
-		includeBin: includeBin,
-		baseDir:    dir,
+		includeAll:      includeGitIgnore,
+		includeGit:      includeGit,
+		includeBin:      includeBin,
+		baseDir:         dir,
+		includePatterns: includePatterns,
+		excludePatterns: excludePatterns,
 	}
 
 	if !includeGitIgnore {
@@ -45,7 +49,22 @@ func NewFilter(dir string, includeGitIgnore bool, includeGit bool, includeBin bo
 }
 
 // ShouldInclude returns true if the file/directory should be included
-func (f *Filter) ShouldInclude(path string) bool {
+func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
+	// Matches is applied to the file name, not the path
+	if !info.IsDir() {
+		// First check include patterns if they exist
+		if len(f.includePatterns) > 0 {
+			if !f.matchesAnyPattern(path, f.includePatterns) {
+				return false
+			}
+		}
+
+		// Then check exclude patterns
+		if f.matchesAnyPattern(path, f.excludePatterns) {
+			return false
+		}
+	}
+
 	// First check git directory rules
 	if !f.includeGit {
 		base := filepath.Base(path)
@@ -59,8 +78,7 @@ func (f *Filter) ShouldInclude(path string) bool {
 
 	// Check if it's a binary file
 	if !f.includeBin {
-		info, err := os.Stat(path)
-		if err == nil && !info.IsDir() {
+		if !info.IsDir() {
 			isBinary, err := f.isBinaryFile(path)
 			if err == nil && isBinary {
 				return false
@@ -161,4 +179,18 @@ func (f *Filter) isBinaryFile(path string) (bool, error) {
 	// Use http.DetectContentType as fallback
 	contentType := http.DetectContentType(buffer)
 	return !strings.HasPrefix(contentType, "text/"), nil
+}
+
+func (f *Filter) matchesAnyPattern(path string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+
+	for _, pattern := range patterns {
+		matched, err := filepath.Match(pattern, filepath.Base(path))
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
 }

@@ -55,6 +55,8 @@ var showOwnership bool
 var showChecksum bool
 var showAllMetadata bool
 var includeBin bool
+var includePatterns []string
+var excludePatterns []string
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -63,7 +65,7 @@ func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	}
 
 	// Check if the file should be included
-	if !filter.ShouldInclude(path) {
+	if !filter.ShouldInclude(info, path) {
 		return nil, nil
 	}
 
@@ -376,7 +378,7 @@ all subdirectories and their contents.`,
 		}
 
 		// Create the filter
-		filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin)
+		filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includePatterns, excludePatterns)
 		if err != nil {
 			return fmt.Errorf("failed to create filter: %w", err)
 		}
@@ -462,6 +464,8 @@ func init() {
 	rootCmd.Flags().BoolVarP(&showChecksum, "show-checksum", "c", false, "Show SHA256 checksum of files")
 	rootCmd.Flags().BoolVarP(&showAllMetadata, "all-metadata", "a", false, "Show all available metadata")
 	rootCmd.Flags().BoolVar(&includeBin, "include-bin", false, "Include binary files in the output")
+	rootCmd.Flags().StringSliceVarP(&includePatterns, "include", "I", []string{}, "Include only files matching these patterns (e.g. '*.go,*.js')")
+	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "E", []string{}, "Exclude files matching these patterns (e.g. '*.test.js')")
 }
 
 func main() {
