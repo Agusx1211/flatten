@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -40,6 +41,7 @@ var skipGitIgnoreAdd bool
 var autoDelete bool
 var autoDeleteTime int
 var noFileDeduplication bool
+var unsafe bool
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -189,15 +191,36 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 }
 
 func scheduleFileDelete(filePath string, seconds int) error {
+	// Check for existing delete process
+	if pid, err := findExistingDeleteProcess(filePath); err != nil {
+		return fmt.Errorf("failed to check for existing delete process: %w", err)
+	} else if pid != 0 {
+		// Found existing process, kill it
+		if err := killProcess(pid); err != nil {
+			return fmt.Errorf("failed to kill existing delete process: %w", err)
+		}
+	}
+
 	// Get absolute path for the file
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	// Create the delete command that will run after N seconds
-	// Using full path for rm command and target file
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("sleep %d && rm %s", seconds, absPath))
+	// Create a shell script that checks the file before deleting
+	script := fmt.Sprintf(`
+sleep %d
+if [ -f "%s" ]; then
+    if head -n 2 "%s" | grep -q "^- Total files: " && head -n 2 "%s" | grep -q "^- Total size: "; then
+        rm "%s"
+    else
+        echo "Warning: File %s no longer appears to be a flattener output. Deletion skipped."
+    fi
+fi
+`, seconds, absPath, absPath, absPath, absPath, absPath)
+
+	// Create the command
+	cmd := exec.Command("sh", "-c", script)
 
 	// Detach the process
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -205,6 +228,78 @@ func scheduleFileDelete(filePath string, seconds int) error {
 	}
 
 	return cmd.Start()
+}
+
+func isFlattenerOutput(path string) (bool, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	if len(lines) < 2 {
+		return false, nil
+	}
+
+	return strings.HasPrefix(lines[0], "- Total files: ") &&
+		strings.HasPrefix(lines[1], "- Total size: "), nil
+}
+
+// findExistingDeleteProcess looks for a process that matches our delete script pattern
+func findExistingDeleteProcess(filePath string) (int, error) {
+	// Get absolute path for consistent comparison
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return 0, err
+	}
+
+	// Use ps to find sleep processes and their parent sh processes
+	cmd := exec.Command("ps", "-ef")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list processes: %w", err)
+	}
+
+	// Split output into lines
+	lines := strings.Split(string(output), "\n")
+
+	// Look for our specific script pattern
+	for _, line := range lines {
+		if strings.Contains(line, "sleep") &&
+			strings.Contains(line, absPath) &&
+			strings.Contains(line, "head -n 2") &&
+			strings.Contains(line, "rm") &&
+			strings.Contains(line, "Total files:") &&
+			strings.Contains(line, "Total size:") &&
+			strings.Contains(line, "grep -q") {
+			// Extract PID - ps output format is: UID PID PPID ...
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			pid, err := strconv.Atoi(fields[1])
+			if err != nil {
+				continue
+			}
+			return pid, nil
+		}
+	}
+
+	return 0, nil
+}
+
+// killProcess attempts to kill a process and its children
+func killProcess(pid int) error {
+	// First try to kill child processes
+	cmd := exec.Command("pkill", "-P", strconv.Itoa(pid))
+	_ = cmd.Run() // Ignore errors as there might not be any children
+
+	// Then kill the main process
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return process.Kill()
 }
 
 var rootCmd = &cobra.Command{
@@ -247,6 +342,18 @@ all subdirectories and their contents.`,
 
 		// Handle output based on flags
 		if toFile {
+			// Check if file exists and verify it's safe to overwrite
+			if _, err := os.Stat(fileName); err == nil && !unsafe {
+				// File exists, check if it's a flattener output
+				isFlattenerFile, err := isFlattenerOutput(fileName)
+				if err != nil {
+					return fmt.Errorf("failed to check existing file: %w", err)
+				}
+				if !isFlattenerFile {
+					return fmt.Errorf("refusing to overwrite %s: file exists and doesn't appear to be flattener output. Use --unsafe to override", fileName)
+				}
+			}
+
 			err := os.WriteFile(fileName, []byte(output.String()), 0644)
 			if err != nil {
 				return fmt.Errorf("failed to write to file: %w", err)
@@ -277,14 +384,15 @@ all subdirectories and their contents.`,
 }
 
 func init() {
-	rootCmd.Flags().BoolVar(&includeGitIgnore, "include-gitignore", false, "Include files that would normally be ignored by .gitignore")
-	rootCmd.Flags().BoolVar(&includeGit, "include-git", false, "Include .git directory and its contents")
-	rootCmd.Flags().BoolVar(&toFile, "tf", false, "Write output to file instead of stdout")
-	rootCmd.Flags().StringVar(&fileName, "fn", "./flat", "Output file name (only used with --tf)")
-	rootCmd.Flags().BoolVar(&skipGitIgnoreAdd, "skip-gitignore", false, "Skip adding output file to .gitignore")
-	rootCmd.Flags().BoolVar(&autoDelete, "ad", false, "Auto delete the output file after N seconds (only used with --tf)")
-	rootCmd.Flags().IntVar(&autoDeleteTime, "adt", 30, "Auto delete time in seconds (only used with --ad)")
+	rootCmd.Flags().BoolVarP(&includeGitIgnore, "include-gitignore", "i", false, "Include files that would normally be ignored by .gitignore")
+	rootCmd.Flags().BoolVarP(&includeGit, "include-git", "g", false, "Include .git directory and its contents")
+	rootCmd.Flags().BoolVarP(&toFile, "to-file", "f", false, "Write output to file instead of stdout")
+	rootCmd.Flags().StringVarP(&fileName, "file-name", "n", "./flat", "Output file name (only used with --to-file)")
+	rootCmd.Flags().BoolVarP(&skipGitIgnoreAdd, "skip-gitignore", "s", false, "Skip adding output file to .gitignore")
+	rootCmd.Flags().BoolVarP(&autoDelete, "auto-delete", "d", false, "Auto delete the output file after N seconds (only used with --to-file)")
+	rootCmd.Flags().IntVar(&autoDeleteTime, "auto-delete-time", 30, "Auto delete time in seconds (only used with --auto-delete)")
 	rootCmd.Flags().BoolVar(&noFileDeduplication, "no-dedup", false, "Disable file deduplication")
+	rootCmd.Flags().BoolVar(&unsafe, "unsafe", false, "Allow overwriting non-flattener output files")
 }
 
 func main() {
