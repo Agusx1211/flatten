@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,14 +17,16 @@ type Filter struct {
 	gitIgnore  *ignore.GitIgnore
 	includeAll bool
 	includeGit bool
+	includeBin bool
 	baseDir    string
 }
 
 // NewFilter creates a new filter for the given directory
-func NewFilter(dir string, includeGitIgnore bool, includeGit bool) (*Filter, error) {
+func NewFilter(dir string, includeGitIgnore bool, includeGit bool, includeBin bool) (*Filter, error) {
 	f := &Filter{
 		includeAll: includeGitIgnore,
 		includeGit: includeGit,
+		includeBin: includeBin,
 		baseDir:    dir,
 	}
 
@@ -42,15 +46,25 @@ func NewFilter(dir string, includeGitIgnore bool, includeGit bool) (*Filter, err
 
 // ShouldInclude returns true if the file/directory should be included
 func (f *Filter) ShouldInclude(path string) bool {
-	// Check for .git directory unless explicitly included
+	// First check git directory rules
 	if !f.includeGit {
 		base := filepath.Base(path)
 		if base == ".git" {
 			return false
 		}
-		// Also check if path contains /.git/ to catch subdirectories
 		if strings.Contains(filepath.ToSlash(path), "/.git/") {
 			return false
+		}
+	}
+
+	// Check if it's a binary file
+	if !f.includeBin {
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() {
+			isBinary, err := f.isBinaryFile(path)
+			if err == nil && isBinary {
+				return false
+			}
 		}
 	}
 
@@ -58,21 +72,17 @@ func (f *Filter) ShouldInclude(path string) bool {
 		return true
 	}
 
-	// If no .gitignore was found, include everything
+	// Check gitignore rules
 	if f.gitIgnore == nil {
 		return true
 	}
 
-	// Make path relative to the base directory for gitignore matching
 	relPath, err := filepath.Rel(f.baseDir, path)
 	if err != nil {
-		// If we can't get relative path, include the file to be safe
 		return true
 	}
 
-	// Convert Windows paths to forward slashes for gitignore matching
 	relPath = filepath.ToSlash(relPath)
-
 	return !f.gitIgnore.MatchesPath(relPath)
 }
 
@@ -124,4 +134,31 @@ func (f *Filter) checkGitIgnoreEntry(filename string) (bool, error) {
 	}
 
 	return false, scanner.Err()
+}
+
+// Add this helper function to detect binary files
+func (f *Filter) isBinaryFile(path string) (bool, error) {
+	// Read first 2048 bytes to determine if file is binary
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	buffer := make([]byte, 2048)
+	n, err := file.Read(buffer)
+	if err != nil {
+		return false, err
+	}
+	buffer = buffer[:n]
+
+	// Use mime.TypeByExtension first for known binary formats
+	mimeType := mime.TypeByExtension(filepath.Ext(path))
+	if strings.Contains(mimeType, "application/") && !strings.Contains(mimeType, "json") && !strings.Contains(mimeType, "xml") {
+		return true, nil
+	}
+
+	// Use http.DetectContentType as fallback
+	contentType := http.DetectContentType(buffer)
+	return !strings.HasPrefix(contentType, "text/"), nil
 }

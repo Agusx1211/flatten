@@ -5,12 +5,16 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"mime"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -42,6 +46,15 @@ var autoDelete bool
 var autoDeleteTime int
 var noFileDeduplication bool
 var unsafe bool
+var showLastUpdated bool
+var showFileMode bool
+var showFileSize bool
+var showMimeType bool
+var showSymlinks bool
+var showOwnership bool
+var showChecksum bool
+var showAllMetadata bool
+var includeBin bool
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -159,18 +172,65 @@ func calculateFileHash(content []byte) string {
 // printFlattenedOutput prints all files and their contents
 func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash) {
 	if !entry.IsDir {
+		// Write basic path info
+		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
+
+		// Add metadata based on enabled flags or all-metadata flag
+		if showAllMetadata || showLastUpdated {
+			w.WriteString(fmt.Sprintf("- last updated: %s\n", time.Unix(entry.ModTime, 0).Format(time.RFC3339)))
+		}
+
+		if showAllMetadata || showFileMode {
+			w.WriteString(fmt.Sprintf("- mode: %s\n", entry.Mode.String()))
+		}
+
+		if showAllMetadata || showFileSize {
+			w.WriteString(fmt.Sprintf("- size: %d bytes\n", entry.Size))
+		}
+
+		if showAllMetadata || showMimeType {
+			mimeType := mime.TypeByExtension(filepath.Ext(entry.Path))
+			if mimeType == "" {
+				mimeType = http.DetectContentType(entry.Content)
+			}
+			w.WriteString(fmt.Sprintf("- mime-type: %s\n", mimeType))
+		}
+
+		if showAllMetadata || (showSymlinks && entry.Mode&os.ModeSymlink != 0) {
+			target, err := os.Readlink(entry.Path)
+			if err == nil {
+				w.WriteString(fmt.Sprintf("- symlink-target: %s\n", target))
+			}
+		}
+
+		if showAllMetadata || showOwnership {
+			info, err := os.Stat(entry.Path)
+			if err == nil {
+				if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+					if owner, err := user.LookupId(fmt.Sprint(stat.Uid)); err == nil {
+						w.WriteString(fmt.Sprintf("- owner: %s\n", owner.Username))
+					}
+					if group, err := user.LookupGroupId(fmt.Sprint(stat.Gid)); err == nil {
+						w.WriteString(fmt.Sprintf("- group: %s\n", group.Name))
+					}
+				}
+			}
+		}
+
+		if showAllMetadata || showChecksum {
+			hash := calculateFileHash(entry.Content)
+			w.WriteString(fmt.Sprintf("- sha256: %s\n", hash))
+		}
+
+		// Handle content output with deduplication logic
 		if noFileDeduplication {
-			// Skip deduplication if flag is set
-			w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
 			return
 		}
 
 		hash := calculateFileHash(entry.Content)
-
 		if existing, exists := fileHashes[hash]; exists {
 			// This is a duplicate file
-			w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 			w.WriteString(fmt.Sprintf("- content: Contents are identical to %s\n", existing.Path))
 		} else {
 			// This is the first occurrence of this file content
@@ -179,12 +239,12 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 				Hash:    hash,
 				Content: entry.Content,
 			}
-			w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
 		}
 		return
 	}
 
+	// Process directory contents
 	for _, child := range entry.Children {
 		printFlattenedOutput(child, w, fileHashes)
 	}
@@ -316,7 +376,7 @@ all subdirectories and their contents.`,
 		}
 
 		// Create the filter
-		filter, err := NewFilter(dir, includeGitIgnore, includeGit)
+		filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin)
 		if err != nil {
 			return fmt.Errorf("failed to create filter: %w", err)
 		}
@@ -393,6 +453,15 @@ func init() {
 	rootCmd.Flags().IntVar(&autoDeleteTime, "auto-delete-time", 30, "Auto delete time in seconds (only used with --auto-delete)")
 	rootCmd.Flags().BoolVar(&noFileDeduplication, "no-dedup", false, "Disable file deduplication")
 	rootCmd.Flags().BoolVar(&unsafe, "unsafe", false, "Allow overwriting non-flattener output files")
+	rootCmd.Flags().BoolVarP(&showLastUpdated, "last-updated", "l", false, "Show last updated time for each file")
+	rootCmd.Flags().BoolVarP(&showFileMode, "show-mode", "m", false, "Show file permissions")
+	rootCmd.Flags().BoolVarP(&showFileSize, "show-size", "z", false, "Show individual file sizes")
+	rootCmd.Flags().BoolVarP(&showMimeType, "show-mime", "t", false, "Show file MIME types")
+	rootCmd.Flags().BoolVarP(&showSymlinks, "show-symlinks", "y", false, "Show symlink targets")
+	rootCmd.Flags().BoolVarP(&showOwnership, "show-owner", "o", false, "Show file owner and group")
+	rootCmd.Flags().BoolVarP(&showChecksum, "show-checksum", "c", false, "Show SHA256 checksum of files")
+	rootCmd.Flags().BoolVarP(&showAllMetadata, "all-metadata", "a", false, "Show all available metadata")
+	rootCmd.Flags().BoolVar(&includeBin, "include-bin", false, "Include binary files in the output")
 }
 
 func main() {

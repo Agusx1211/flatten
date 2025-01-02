@@ -66,6 +66,7 @@ go.sum
 # Build output
 build/
 out/
+flatten
 
 # Output file from flatten tool
 flat
