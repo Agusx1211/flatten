@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -23,6 +25,13 @@ type FileEntry struct {
 	Children []*FileEntry
 }
 
+// FileHash represents a file hash and its path
+type FileHash struct {
+	Path    string
+	Hash    string
+	Content []byte
+}
+
 var includeGitIgnore bool
 var includeGit bool
 var toFile bool
@@ -30,6 +39,7 @@ var fileName string
 var skipGitIgnoreAdd bool
 var autoDelete bool
 var autoDeleteTime int
+var noFileDeduplication bool
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -137,16 +147,44 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool) string {
 	return sb.String()
 }
 
+// calculateFileHash calculates the SHA256 hash of a file content
+func calculateFileHash(content []byte) string {
+	hasher := sha256.New()
+	hasher.Write(content)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 // printFlattenedOutput prints all files and their contents
-func printFlattenedOutput(entry *FileEntry, w *strings.Builder) {
+func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash) {
 	if !entry.IsDir {
-		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
-		w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
+		if noFileDeduplication {
+			// Skip deduplication if flag is set
+			w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
+			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
+			return
+		}
+
+		hash := calculateFileHash(entry.Content)
+
+		if existing, exists := fileHashes[hash]; exists {
+			// This is a duplicate file
+			w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
+			w.WriteString(fmt.Sprintf("- content: Contents are identical to %s\n", existing.Path))
+		} else {
+			// This is the first occurrence of this file content
+			fileHashes[hash] = &FileHash{
+				Path:    entry.Path,
+				Hash:    hash,
+				Content: entry.Content,
+			}
+			w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
+			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
+		}
 		return
 	}
 
 	for _, child := range entry.Children {
-		printFlattenedOutput(child, w)
+		printFlattenedOutput(child, w, fileHashes)
 	}
 }
 
@@ -201,8 +239,11 @@ all subdirectories and their contents.`,
 		output.WriteString(fmt.Sprintf("- Total size: %d bytes\n", getTotalSize(root)))
 		output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false)))
 
-		// Write flattened file contents
-		printFlattenedOutput(root, &output)
+		// Initialize fileHashes map
+		fileHashes := make(map[string]*FileHash)
+
+		// Write flattened file contents with duplicate detection
+		printFlattenedOutput(root, &output, fileHashes)
 
 		// Handle output based on flags
 		if toFile {
@@ -243,6 +284,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&skipGitIgnoreAdd, "skip-gitignore", false, "Skip adding output file to .gitignore")
 	rootCmd.Flags().BoolVar(&autoDelete, "ad", false, "Auto delete the output file after N seconds (only used with --tf)")
 	rootCmd.Flags().IntVar(&autoDeleteTime, "adt", 30, "Auto delete time in seconds (only used with --ad)")
+	rootCmd.Flags().BoolVar(&noFileDeduplication, "no-dedup", false, "Disable file deduplication")
 }
 
 func main() {
