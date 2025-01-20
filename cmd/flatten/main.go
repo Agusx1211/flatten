@@ -36,22 +36,24 @@ type FileHash struct {
 	Content []byte
 }
 
-var includeGitIgnore bool
-var includeGit bool
-var includeBin bool
-var noFileDeduplication bool
+var (
+	includeGitIgnore    bool
+	includeGit          bool
+	includeBin          bool
+	noFileDeduplication bool
 
-var showLastUpdated bool
-var showFileMode bool
-var showFileSize bool
-var showMimeType bool
-var showSymlinks bool
-var showOwnership bool
-var showChecksum bool
-var showAllMetadata bool
+	showLastUpdated bool
+	showFileMode    bool
+	showFileSize    bool
+	showMimeType    bool
+	showSymlinks    bool
+	showOwnership   bool
+	showChecksum    bool
+	showAllMetadata bool
 
-var includePatterns []string
-var excludePatterns []string
+	includePatterns []string
+	excludePatterns []string
+)
 
 func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	info, err := os.Stat(path)
@@ -151,7 +153,6 @@ func calculateFileHash(content []byte) string {
 func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash) {
 	if !entry.IsDir {
 		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
-
 		if showAllMetadata || showLastUpdated {
 			w.WriteString(fmt.Sprintf("- last updated: %s\n", time.Unix(entry.ModTime, 0).Format(time.RFC3339)))
 		}
@@ -188,7 +189,6 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			hash := calculateFileHash(entry.Content)
 			w.WriteString(fmt.Sprintf("- sha256: %s\n", hash))
 		}
-
 		if noFileDeduplication {
 			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
 			return
@@ -215,33 +215,40 @@ func guessMimeType(path string, content []byte) string {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "flatten [directory]",
-	Short: "Flatten outputs a directory structure as a flat representation",
-	Long: `Flatten is a CLI tool that takes a directory as input and outputs
-a flat representation of all its contents to stdout. It recursively processes
-all subdirectories and their contents.`,
-	Args: cobra.MaximumNArgs(1),
+	Use:   "flatten [directories]...",
+	Short: "Flatten outputs one or more directories as a flat representation",
+	Long: `Flatten takes one or more directories as input and outputs
+a flat representation of all their contents to stdout. It recursively processes
+subdirectories and their contents for each provided directory.`,
+	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dir := "."
-		if len(args) > 0 {
-			dir = args[0]
-		}
-		filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includePatterns, excludePatterns)
-		if err != nil {
-			return fmt.Errorf("failed to create filter: %w", err)
-		}
-		root, err := loadDirectory(dir, filter)
-		if err != nil {
-			return fmt.Errorf("failed to load directory structure: %w", err)
+		// If no directories provided, use current directory
+		if len(args) == 0 {
+			args = []string{"."}
 		}
 
-		var output strings.Builder
-		output.WriteString(fmt.Sprintf("- Total files: %d\n", getTotalFiles(root)))
-		output.WriteString(fmt.Sprintf("- Total size: %d bytes\n", getTotalSize(root)))
-		output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false)))
-
+		// We share a single fileHashes map so that deduplication can happen across directories
 		fileHashes := make(map[string]*FileHash)
-		printFlattenedOutput(root, &output, fileHashes)
+		var output strings.Builder
+
+		for _, dir := range args {
+			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includePatterns, excludePatterns)
+			if err != nil {
+				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
+			}
+			root, err := loadDirectory(dir, filter)
+			if err != nil {
+				return fmt.Errorf("failed to load directory structure for %s: %w", dir, err)
+			}
+			if root == nil {
+				continue
+			}
+			output.WriteString(fmt.Sprintf("\nDirectory: %s\n", dir))
+			output.WriteString(fmt.Sprintf("- Total files: %d\n", getTotalFiles(root)))
+			output.WriteString(fmt.Sprintf("- Total size: %d bytes\n", getTotalSize(root)))
+			output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false)))
+			printFlattenedOutput(root, &output, fileHashes)
+		}
 
 		fmt.Print(output.String())
 		return nil
