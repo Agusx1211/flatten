@@ -8,13 +8,13 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"os/user"
-
+	"github.com/pkoukk/tiktoken-go"
 	"github.com/spf13/cobra"
 )
 
@@ -26,16 +26,18 @@ type FileEntry struct {
 	Mode     fs.FileMode
 	ModTime  int64
 	Content  []byte
+	Tokens   int
 	Children []*FileEntry
 }
 
-// FileHash represents a file hash and its path
+// FileHash is used for deduplication
 type FileHash struct {
 	Path    string
 	Hash    string
 	Content []byte
 }
 
+// Flags
 var (
 	includeGitIgnore    bool
 	includeGit          bool
@@ -51,11 +53,27 @@ var (
 	showChecksum    bool
 	showAllMetadata bool
 
+	showTokens  bool
+	tokensModel string
+
 	includePatterns []string
 	excludePatterns []string
 )
 
-func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
+// sumTokens recurses over a directory entry and sums the tokens of all children
+func sumTokens(entry *FileEntry) int {
+	if !entry.IsDir {
+		return entry.Tokens
+	}
+	var total int
+	for _, child := range entry.Children {
+		total += sumTokens(child)
+	}
+	entry.Tokens = total
+	return total
+}
+
+func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*FileEntry, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat path %s: %w", path, err)
@@ -77,6 +95,10 @@ func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 			return nil, fmt.Errorf("failed to read file %s: %w", path, err)
 		}
 		entry.Content = content
+		if tokenizer != nil {
+			toks := tokenizer.Encode(string(content), nil, nil)
+			entry.Tokens = len(toks)
+		}
 		return entry, nil
 	}
 	entries, err := os.ReadDir(path)
@@ -85,7 +107,7 @@ func loadDirectory(path string, filter *Filter) (*FileEntry, error) {
 	}
 	for _, item := range entries {
 		childPath := filepath.Join(path, item.Name())
-		child, err := loadDirectory(childPath, filter)
+		child, err := loadDirectory(childPath, filter, tokenizer)
 		if err != nil {
 			return nil, err
 		}
@@ -118,14 +140,18 @@ func getTotalSize(entry *FileEntry) int64 {
 	return total
 }
 
-func renderDirTree(entry *FileEntry, prefix string, isLast bool) string {
+func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool) string {
 	var sb strings.Builder
 	if entry.Path != "." {
 		marker := "├── "
 		if isLast {
 			marker = "└── "
 		}
-		sb.WriteString(prefix + marker + filepath.Base(entry.Path) + "\n")
+		name := filepath.Base(entry.Path)
+		if showTokens {
+			name = fmt.Sprintf("%s (%d tokens)", name, entry.Tokens)
+		}
+		sb.WriteString(prefix + marker + name + "\n")
 	}
 	if entry.IsDir {
 		newPrefix := prefix
@@ -138,7 +164,7 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool) string {
 		}
 		for i, child := range entry.Children {
 			isLastChild := i == len(entry.Children)-1
-			sb.WriteString(renderDirTree(child, newPrefix, isLastChild))
+			sb.WriteString(renderDirTree(child, newPrefix, isLastChild, showTokens))
 		}
 	}
 	return sb.String()
@@ -150,7 +176,7 @@ func calculateFileHash(content []byte) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash) {
+func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool) {
 	if !entry.IsDir {
 		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 		if showAllMetadata || showLastUpdated {
@@ -189,6 +215,9 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			hash := calculateFileHash(entry.Content)
 			w.WriteString(fmt.Sprintf("- sha256: %s\n", hash))
 		}
+		if showTokens {
+			w.WriteString(fmt.Sprintf("- tokens: %d\n", entry.Tokens))
+		}
 		if noFileDeduplication {
 			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
 			return
@@ -202,8 +231,12 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 		}
 		return
 	}
+	if showTokens {
+		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
+		w.WriteString(fmt.Sprintf("- dir tokens: %d\n", entry.Tokens))
+	}
 	for _, child := range entry.Children {
-		printFlattenedOutput(child, w, fileHashes)
+		printFlattenedOutput(child, w, fileHashes, showTokens)
 	}
 }
 
@@ -222,12 +255,19 @@ a flat representation of all their contents to stdout. It recursively processes
 subdirectories and their contents for each provided directory.`,
 	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// If no directories provided, use current directory
 		if len(args) == 0 {
 			args = []string{"."}
 		}
 
-		// We share a single fileHashes map so that deduplication can happen across directories
+		var tokenizer *tiktoken.Tiktoken
+		if showTokens {
+			var err error
+			tokenizer, err = tiktoken.EncodingForModel(tokensModel)
+			if err != nil {
+				return fmt.Errorf("failed to get tokenizer for model %q: %w", tokensModel, err)
+			}
+		}
+
 		fileHashes := make(map[string]*FileHash)
 		var output strings.Builder
 
@@ -236,18 +276,21 @@ subdirectories and their contents for each provided directory.`,
 			if err != nil {
 				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
 			}
-			root, err := loadDirectory(dir, filter)
+			root, err := loadDirectory(dir, filter, tokenizer)
 			if err != nil {
 				return fmt.Errorf("failed to load directory structure for %s: %w", dir, err)
 			}
 			if root == nil {
 				continue
 			}
+			if showTokens {
+				sumTokens(root)
+			}
 			output.WriteString(fmt.Sprintf("\nDirectory: %s\n", dir))
 			output.WriteString(fmt.Sprintf("- Total files: %d\n", getTotalFiles(root)))
 			output.WriteString(fmt.Sprintf("- Total size: %d bytes\n", getTotalSize(root)))
-			output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false)))
-			printFlattenedOutput(root, &output, fileHashes)
+			output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false, showTokens)))
+			printFlattenedOutput(root, &output, fileHashes, showTokens)
 		}
 
 		fmt.Print(output.String())
@@ -256,18 +299,23 @@ subdirectories and their contents for each provided directory.`,
 }
 
 func init() {
-	rootCmd.Flags().BoolVarP(&includeGitIgnore, "include-gitignore", "i", false, "Include files that would normally be ignored by .gitignore")
-	rootCmd.Flags().BoolVarP(&includeGit, "include-git", "g", false, "Include .git directory and its contents")
+	rootCmd.Flags().BoolVarP(&includeGitIgnore, "include-gitignore", "i", false, "Include files normally ignored by .gitignore")
+	rootCmd.Flags().BoolVarP(&includeGit, "include-git", "g", false, "Include .git directory")
 	rootCmd.Flags().BoolVar(&includeBin, "include-bin", false, "Include binary files in the output")
 	rootCmd.Flags().BoolVar(&noFileDeduplication, "no-dedup", false, "Disable file deduplication")
+
 	rootCmd.Flags().BoolVarP(&showLastUpdated, "last-updated", "l", false, "Show last updated time for each file")
 	rootCmd.Flags().BoolVarP(&showFileMode, "show-mode", "m", false, "Show file permissions")
 	rootCmd.Flags().BoolVarP(&showFileSize, "show-size", "z", false, "Show individual file sizes")
-	rootCmd.Flags().BoolVarP(&showMimeType, "show-mime", "t", false, "Show file MIME types")
+	rootCmd.Flags().BoolVarP(&showMimeType, "show-mime", "M", false, "Show file MIME types")
 	rootCmd.Flags().BoolVarP(&showSymlinks, "show-symlinks", "y", false, "Show symlink targets")
 	rootCmd.Flags().BoolVarP(&showOwnership, "show-owner", "o", false, "Show file owner and group")
 	rootCmd.Flags().BoolVarP(&showChecksum, "show-checksum", "c", false, "Show SHA256 checksum of files")
-	rootCmd.Flags().BoolVarP(&showAllMetadata, "all-metadata", "a", false, "Show all available metadata")
+	rootCmd.Flags().BoolVarP(&showAllMetadata, "all-metadata", "a", false, "Show all metadata")
+
+	rootCmd.Flags().BoolVarP(&showTokens, "tokens", "t", false, "Show token usage for each file/directory")
+	rootCmd.Flags().StringVar(&tokensModel, "tokens-model", "gpt-4o-mini", "Model to use for token counting")
+
 	rootCmd.Flags().StringSliceVarP(&includePatterns, "include", "I", []string{}, "Include only files matching these patterns (e.g. '*.go,*.js')")
 	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "E", []string{}, "Exclude files matching these patterns (e.g. '*.test.js')")
 }
