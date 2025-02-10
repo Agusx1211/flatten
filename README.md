@@ -70,6 +70,18 @@ Flags:
   -E, --exclude             Exclude files matching these patterns (e.g. '*.test.js')
 ```
 
+### Filter Priority
+When multiple filters are active, they are applied in the following order:
+
+1. .gitignore rules (unless --include-gitignore is set)
+2. Directory exclusions
+3. .git directory (unless --include-git is set)
+4. Binary files (unless --include-bin is set)
+5. Explicit exclude patterns (-E/--exclude)
+6. Explicit include patterns (-I/--include)
+
+A file must pass all applicable filters to be included in the output. If no `--include` patterns are specified, all files that pass the other filters will be included. The `--include` flag acts as an additional filter, only taking effect when explicitly set.
+
 ## License
 MIT License
 
