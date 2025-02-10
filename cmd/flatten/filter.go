@@ -75,13 +75,14 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 	}
 
 	if !info.IsDir() {
+		if f.matchesAnyPattern(path, f.excludePatterns) {
+			return false
+		}
+
 		if len(f.includePatterns) > 0 {
 			if !f.matchesAnyPattern(path, f.includePatterns) {
 				return false
 			}
-		}
-		if f.matchesAnyPattern(path, f.excludePatterns) {
-			return false
 		}
 	}
 
