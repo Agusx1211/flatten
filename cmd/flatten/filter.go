@@ -70,22 +70,23 @@ func NewFilter(
 
 // ShouldInclude returns true if the file/directory should be included
 func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
-	if info.IsDir() && f.isExcludedDir(path) {
-		return false
-	}
-
-	if !info.IsDir() {
-		if f.matchesAnyPattern(path, f.excludePatterns) {
-			return false
-		}
-
-		if len(f.includePatterns) > 0 {
-			if !f.matchesAnyPattern(path, f.includePatterns) {
+	// If not includeAll (--include-gitignore), check gitignore first
+	if !f.includeAll && f.gitIgnore != nil {
+		relPath, err := filepath.Rel(f.baseDir, path)
+		if err == nil {
+			relPath = filepath.ToSlash(relPath)
+			if f.gitIgnore.MatchesPath(relPath) {
 				return false
 			}
 		}
 	}
 
+	// Check excluded directories
+	if info.IsDir() && f.isExcludedDir(path) {
+		return false
+	}
+
+	// Check .git directory exclusion
 	if !f.includeGit {
 		base := filepath.Base(path)
 		if base == ".git" || strings.Contains(filepath.ToSlash(path), "/.git/") {
@@ -93,27 +94,27 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		}
 	}
 
-	if !f.includeBin && !info.IsDir() {
-		isBinary, err := f.isBinaryFile(path)
-		if err == nil && isBinary {
+	if !info.IsDir() {
+		// Check binary exclusion
+		if !f.includeBin {
+			isBinary, err := f.isBinaryFile(path)
+			if err == nil && isBinary {
+				return false
+			}
+		}
+
+		// Check explicit exclude patterns
+		if f.matchesAnyPattern(path, f.excludePatterns) {
 			return false
+		}
+
+		// If include patterns exist, file must match at least one
+		if len(f.includePatterns) > 0 {
+			return f.matchesAnyPattern(path, f.includePatterns)
 		}
 	}
 
-	if f.includeAll {
-		return true
-	}
-
-	if f.gitIgnore == nil {
-		return true
-	}
-
-	relPath, err := filepath.Rel(f.baseDir, path)
-	if err != nil {
-		return true
-	}
-	relPath = filepath.ToSlash(relPath)
-	return !f.gitIgnore.MatchesPath(relPath)
+	return true
 }
 
 func (f *Filter) isExcludedDir(path string) bool {
