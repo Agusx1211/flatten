@@ -42,6 +42,7 @@ var (
 	includeGitIgnore    bool
 	includeGit          bool
 	includeBin          bool
+	includeLocks        bool
 	noFileDeduplication bool
 
 	showLastUpdated bool
@@ -272,7 +273,7 @@ subdirectories and their contents for each provided directory.`,
 		var output strings.Builder
 
 		for _, dir := range args {
-			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includePatterns, excludePatterns)
+			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includeLocks, includePatterns, excludePatterns)
 			if err != nil {
 				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
 			}
@@ -302,6 +303,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&includeGitIgnore, "include-gitignore", "i", false, "Include files normally ignored by .gitignore")
 	rootCmd.Flags().BoolVarP(&includeGit, "include-git", "g", false, "Include .git directory")
 	rootCmd.Flags().BoolVar(&includeBin, "include-bin", false, "Include binary files in the output")
+	rootCmd.Flags().BoolVar(&includeLocks, "include-locks", false, "Include lock files (package-lock.json, yarn.lock, etc.)")
 	rootCmd.Flags().BoolVar(&noFileDeduplication, "no-dedup", false, "Disable file deduplication")
 
 	rootCmd.Flags().BoolVarP(&showLastUpdated, "last-updated", "l", false, "Show last updated time for each file")

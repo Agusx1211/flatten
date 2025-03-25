@@ -16,6 +16,7 @@ type Filter struct {
 	includeAll      bool
 	includeGit      bool
 	includeBin      bool
+	includeLocks    bool
 	baseDir         string
 	includePatterns []string
 	excludePatterns []string
@@ -29,6 +30,7 @@ func NewFilter(
 	includeGitIgnore bool,
 	includeGit bool,
 	includeBin bool,
+	includeLocks bool,
 	includePatterns []string,
 	excludePatterns []string,
 ) (*Filter, error) {
@@ -48,6 +50,7 @@ func NewFilter(
 		includeAll:      includeGitIgnore,
 		includeGit:      includeGit,
 		includeBin:      includeBin,
+		includeLocks:    includeLocks,
 		baseDir:         dir,
 		includePatterns: includePatterns,
 		excludePatterns: fileExcludePatterns,
@@ -92,6 +95,13 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		}
 	}
 
+	if !f.includeLocks && !info.IsDir() {
+		base := filepath.Base(path)
+		if isLockFile(base) {
+			return false
+		}
+	}
+
 	if !f.includeBin && !info.IsDir() {
 		isBinary, err := f.isBinaryFile(path)
 		if err == nil && isBinary {
@@ -130,8 +140,29 @@ func (f *Filter) isExcludedDir(path string) bool {
 	return false
 }
 
-// isBinaryFile attempts a quick detection of whether the file is binary or text
 func (f *Filter) isBinaryFile(path string) (bool, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case
+		".txt", ".md", ".markdown", ".rst", ".org",
+		".html", ".htm", ".xhtml", ".xml",
+		".css", ".scss", ".sass", ".less",
+		".js", ".cjs", ".mjs", ".jsx",
+		".ts", ".tsx",
+		".c", ".cpp", ".h", ".hpp", ".cc", ".cxx", ".hh",
+		".go", ".py", ".pyi", ".pyw", ".rb", ".php", ".phtml", ".java", ".cs", ".vb",
+		".sh", ".bash", ".zsh", ".fish", ".bat", ".ps1",
+		".sql", ".graphql", ".gql",
+		".json", ".json5", ".yaml", ".yml", ".toml", ".ini", ".env", ".cfg", ".conf",
+		".lua", ".rs", ".swift", ".scala", ".dart", ".erl", ".elixir",
+		".svg", ".vue", ".svelte",
+		".lock", ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig",
+		".eslint", ".eslintrc", ".prettierrc", ".babelrc", ".stylelintrc",
+		".npmrc", ".yarnrc":
+		// Treat all these known text-based extensions as non-binary
+		return false, nil
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		return false, err
@@ -145,13 +176,15 @@ func (f *Filter) isBinaryFile(path string) (bool, error) {
 	}
 	buffer = buffer[:n]
 
-	mimeType := mime.TypeByExtension(filepath.Ext(path))
+	mimeType := mime.TypeByExtension(ext)
+	// If it's "application/" but not explicitly JSON/XML, treat as binary
 	if strings.Contains(mimeType, "application/") &&
 		!strings.Contains(mimeType, "json") &&
 		!strings.Contains(mimeType, "xml") {
 		return true, nil
 	}
 
+	// Fallback to sniffing the first bytes
 	contentType := http.DetectContentType(buffer)
 	return !strings.HasPrefix(contentType, "text/"), nil
 }
@@ -167,4 +200,33 @@ func (f *Filter) matchesAnyPattern(path string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// isLockFile checks if a file is a lock file
+func isLockFile(filename string) bool {
+	lockFiles := []string{
+		"package-lock.json",
+		"yarn.lock",
+		"pnpm-lock.yaml",
+		"Pipfile.lock",
+		"poetry.lock",
+		"Gemfile.lock",
+		"go.sum",
+		"Cargo.lock",
+		"composer.lock",
+		"mix.lock",
+		"shard.lock",
+		"flake.lock",
+		"gradle.lockfile",
+		"packages.lock.json",
+		"project.lock.json",
+	}
+
+	for _, lockFile := range lockFiles {
+		if strings.EqualFold(filename, lockFile) {
+			return true
+		}
+	}
+
+	return strings.HasSuffix(filename, ".lock")
 }
