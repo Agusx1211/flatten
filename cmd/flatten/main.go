@@ -53,6 +53,7 @@ var (
 	showOwnership   bool
 	showChecksum    bool
 	showAllMetadata bool
+	showTotalSize   bool
 
 	showTokens  bool
 	tokensModel string
@@ -148,7 +149,15 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool
 		if isLast {
 			marker = "└── "
 		}
-		name := filepath.Base(entry.Path)
+		// For the root's direct children (top-level dirs), show full path
+		// For everything else, show just the base name
+		name := entry.Path
+		if !strings.HasPrefix(prefix, "│") && !strings.HasPrefix(prefix, " ") {
+			// This is a top-level directory, keep full path
+		} else {
+			// This is a child, show only base name
+			name = filepath.Base(entry.Path)
+		}
 		if showTokens {
 			name = fmt.Sprintf("%s (%d tokens)", name, entry.Tokens)
 		}
@@ -272,27 +281,40 @@ subdirectories and their contents for each provided directory.`,
 		fileHashes := make(map[string]*FileHash)
 		var output strings.Builder
 
+		// Create a root entry that will contain all directories
+		root := &FileEntry{
+			Path:     ".",
+			IsDir:    true,
+			Children: make([]*FileEntry, 0),
+		}
+
+		// Process each directory and add it to the root
 		for _, dir := range args {
 			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includeLocks, includePatterns, excludePatterns)
 			if err != nil {
 				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
 			}
-			root, err := loadDirectory(dir, filter, tokenizer)
+			dirEntry, err := loadDirectory(dir, filter, tokenizer)
 			if err != nil {
 				return fmt.Errorf("failed to load directory structure for %s: %w", dir, err)
 			}
-			if root == nil {
+			if dirEntry == nil {
 				continue
 			}
-			if showTokens {
-				sumTokens(root)
-			}
-			output.WriteString(fmt.Sprintf("\nDirectory: %s\n", dir))
-			output.WriteString(fmt.Sprintf("- Total files: %d\n", getTotalFiles(root)))
-			output.WriteString(fmt.Sprintf("- Total size: %d bytes\n", getTotalSize(root)))
-			output.WriteString(fmt.Sprintf("- Dir tree:\n%s\n", renderDirTree(root, "", false, showTokens)))
-			printFlattenedOutput(root, &output, fileHashes, showTokens)
+			root.Children = append(root.Children, dirEntry)
 		}
+
+		if showTokens {
+			sumTokens(root)
+		}
+
+		// Write a single map for all directories
+		output.WriteString(fmt.Sprintf("\nTotal files: %d\n", getTotalFiles(root)))
+		if showTotalSize {
+			output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
+		}
+		output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTree(root, "", false, showTokens)))
+		printFlattenedOutput(root, &output, fileHashes, showTokens)
 
 		fmt.Print(output.String())
 		return nil
@@ -314,6 +336,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&showOwnership, "show-owner", "o", false, "Show file owner and group")
 	rootCmd.Flags().BoolVarP(&showChecksum, "show-checksum", "c", false, "Show SHA256 checksum of files")
 	rootCmd.Flags().BoolVarP(&showAllMetadata, "all-metadata", "a", false, "Show all metadata")
+	rootCmd.Flags().BoolVarP(&showTotalSize, "show-total-size", "Z", false, "Show total size of all files")
 
 	rootCmd.Flags().BoolVarP(&showTokens, "tokens", "t", false, "Show token usage for each file/directory")
 	rootCmd.Flags().StringVar(&tokensModel, "tokens-model", "gpt-4o-mini", "Model to use for token counting")
