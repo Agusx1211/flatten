@@ -1,20 +1,63 @@
 # Flatten
+
+[![Build and Release](https://github.com/Agusx1211/flatten/actions/workflows/build.yml/badge.svg)](https://github.com/Agusx1211/flatten/actions/workflows/build.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/agusx1211/flatten)](https://goreportcard.com/report/github.com/agusx1211/flatten)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Flatten is a CLI tool that takes a directory as input and outputs a flat representation of its contents to stdout. It recurses into subdirectories and collects every file (even large ones, if you enable that) in a single readable listing. It's handy for quick overviews, backups, or curious exploration.
 
 ## Features
 You can toggle metadata details like last modified time, file permissions, sizes, checksums, and more. You can also include or exclude certain special files or directories with options like `--include-git`, `--include-gitignore`, or `--include-bin` if you want your binary files included.
 
-## Install
-Grab Go 1.21 or newer, clone this repository, then run:
-```
-go build -o flatten ./cmd/flatten
-```
-Place the resulting `flatten` binary somewhere in your PATH.
+## Installation
 
-Or simply:
-```
+### Pre-built Binaries
+Download the latest release from the [GitHub Releases page](https://github.com/Agusx1211/flatten/releases). Binaries are available for:
+- Linux (amd64, 386, arm64, arm)
+- macOS/Darwin (amd64, arm64)  
+- Windows (amd64, 386, arm64)
+- FreeBSD (amd64, 386, arm64)
+
+### From Source
+Grab Go 1.21 or newer, clone this repository, then run:
+```bash
 go install github.com/agusx1211/flatten/cmd/flatten@latest
 ```
+
+Or build locally:
+```bash
+git clone https://github.com/agusx1211/flatten.git
+cd flatten
+make build
+```
+
+### Docker
+```bash
+docker run --rm -v $(pwd):/workspace ghcr.io/agusx1211/flatten:latest
+```
+
+## Building
+
+### Quick Build (Current Platform)
+```bash
+make build
+# or
+./build-local.sh
+```
+
+### Build for All Platforms
+```bash
+make build-all
+# or
+./build.sh [version]
+```
+
+### Available Make Targets
+- `make build` - Build for current platform
+- `make build-all` - Build for all platforms  
+- `make test` - Run tests
+- `make clean` - Clean build artifacts
+- `make install` - Install to GOPATH/bin
 
 ## Requisites
 Just a recent version of Go. There are a few external libraries for CLI and .gitignore parsing, but they're fetched automatically when you build or install.

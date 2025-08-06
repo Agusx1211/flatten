@@ -10,6 +10,11 @@
 /bin/
 /dist/
 
+# Build artifacts
+/build/
+*.tar.gz
+*.zip
+
 # Go workspace file
 go.work
 

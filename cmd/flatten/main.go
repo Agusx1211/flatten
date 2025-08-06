@@ -8,15 +8,16 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/pkoukk/tiktoken-go"
 	"github.com/spf13/cobra"
 )
+
+// Version information (set by build process)
+var version = "dev"
 
 // FileEntry represents a file in the flattened structure
 type FileEntry struct {
@@ -60,7 +61,47 @@ var (
 
 	includePatterns []string
 	excludePatterns []string
+
+	markdownDelimiter string
+	dryRun            bool
 )
+
+// Available markdown delimiters in order of preference for auto-detection
+var availableDelimiters = []string{"```", "~~~", "`````", "~~~~~", "~~~~~~~~~~~"}
+
+// detectBestDelimiter scans all files and returns the first delimiter that's not used
+func detectBestDelimiter(root *FileEntry) string {
+	usedDelimiters := make(map[string]bool)
+
+	// Recursively scan all files for delimiter usage
+	scanForDelimiters(root, usedDelimiters)
+
+	// Return the first delimiter that's not used
+	for _, delimiter := range availableDelimiters {
+		if !usedDelimiters[delimiter] {
+			return delimiter
+		}
+	}
+
+	// Fallback to the longest delimiter if all are used
+	return availableDelimiters[len(availableDelimiters)-1]
+}
+
+// scanForDelimiters recursively scans files for delimiter usage
+func scanForDelimiters(entry *FileEntry, usedDelimiters map[string]bool) {
+	if !entry.IsDir {
+		content := string(entry.Content)
+		for _, delimiter := range availableDelimiters {
+			if strings.Contains(content, delimiter) {
+				usedDelimiters[delimiter] = true
+			}
+		}
+	} else {
+		for _, child := range entry.Children {
+			scanForDelimiters(child, usedDelimiters)
+		}
+	}
+}
 
 // sumTokens recurses over a directory entry and sums the tokens of all children
 func sumTokens(entry *FileEntry) int {
@@ -110,6 +151,44 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 	for _, item := range entries {
 		childPath := filepath.Join(path, item.Name())
 		child, err := loadDirectory(childPath, filter, tokenizer)
+		if err != nil {
+			return nil, err
+		}
+		if child != nil {
+			entry.Children = append(entry.Children, child)
+		}
+	}
+	return entry, nil
+}
+
+func loadDirectoryDryRun(path string, filter *Filter) (*FileEntry, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat path %s: %w", path, err)
+	}
+	if !filter.ShouldInclude(info, path) {
+		return nil, nil
+	}
+	entry := &FileEntry{
+		Path:     path,
+		IsDir:    info.IsDir(),
+		Size:     info.Size(),
+		Mode:     info.Mode(),
+		ModTime:  info.ModTime().Unix(),
+		Children: make([]*FileEntry, 0),
+		Content:  nil, // Don't read file content in dry-run mode
+		Tokens:   0,   // No token counting in dry-run mode
+	}
+	if !info.IsDir() {
+		return entry, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory %s: %w", path, err)
+	}
+	for _, item := range entries {
+		childPath := filepath.Join(path, item.Name())
+		child, err := loadDirectoryDryRun(childPath, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -181,12 +260,15 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool
 }
 
 func calculateFileHash(content []byte) string {
+	if content == nil {
+		return ""
+	}
 	hasher := sha256.New()
 	hasher.Write(content)
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool) {
+func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string) {
 	if !entry.IsDir {
 		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 		if showAllMetadata || showLastUpdated {
@@ -209,17 +291,7 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			}
 		}
 		if showAllMetadata || showOwnership {
-			info, err := os.Stat(entry.Path)
-			if err == nil {
-				if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-					if owner, err := user.LookupId(fmt.Sprint(stat.Uid)); err == nil {
-						w.WriteString(fmt.Sprintf("- owner: %s\n", owner.Username))
-					}
-					if group, err := user.LookupGroupId(fmt.Sprint(stat.Gid)); err == nil {
-						w.WriteString(fmt.Sprintf("- group: %s\n", group.Name))
-					}
-				}
-			}
+			getOwnershipInfo(entry.Path, w)
 		}
 		if showAllMetadata || showChecksum {
 			hash := calculateFileHash(entry.Content)
@@ -229,7 +301,7 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			w.WriteString(fmt.Sprintf("- tokens: %d\n", entry.Tokens))
 		}
 		if noFileDeduplication {
-			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
+			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, string(entry.Content), delimiter))
 			return
 		}
 		hash := calculateFileHash(entry.Content)
@@ -237,7 +309,7 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			w.WriteString(fmt.Sprintf("- content: Contents are identical to %s\n", existing.Path))
 		} else {
 			fileHashes[hash] = &FileHash{Path: entry.Path, Hash: hash, Content: entry.Content}
-			w.WriteString(fmt.Sprintf("- content:\n```\n%s\n```\n", string(entry.Content)))
+			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, string(entry.Content), delimiter))
 		}
 		return
 	}
@@ -246,13 +318,26 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 		w.WriteString(fmt.Sprintf("- dir tokens: %d\n", entry.Tokens))
 	}
 	for _, child := range entry.Children {
-		printFlattenedOutput(child, w, fileHashes, showTokens)
+		printFlattenedOutput(child, w, fileHashes, showTokens, delimiter)
+	}
+}
+
+func printDryRunOutput(entry *FileEntry, w *strings.Builder) {
+	if !entry.IsDir {
+		w.WriteString(fmt.Sprintf("%s\n", entry.Path))
+		return
+	}
+	for _, child := range entry.Children {
+		printDryRunOutput(child, w)
 	}
 }
 
 func guessMimeType(path string, content []byte) string {
 	if mimeType := mime.TypeByExtension(filepath.Ext(path)); mimeType != "" {
 		return mimeType
+	}
+	if content == nil {
+		return "application/octet-stream"
 	}
 	return http.DetectContentType(content)
 }
@@ -263,14 +348,29 @@ var rootCmd = &cobra.Command{
 	Long: `Flatten takes one or more directories as input and outputs
 a flat representation of all their contents to stdout. It recursively processes
 subdirectories and their contents for each provided directory.`,
-	Args: cobra.ArbitraryArgs,
+	Version: version,
+	Args:    cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			args = []string{"."}
 		}
 
+		// Validate markdown delimiter
+		if markdownDelimiter != "auto" {
+			validDelimiter := false
+			for _, delimiter := range availableDelimiters {
+				if markdownDelimiter == delimiter {
+					validDelimiter = true
+					break
+				}
+			}
+			if !validDelimiter {
+				return fmt.Errorf("invalid markdown delimiter %q, must be one of: auto, %s", markdownDelimiter, strings.Join(availableDelimiters, ", "))
+			}
+		}
+
 		var tokenizer *tiktoken.Tiktoken
-		if showTokens {
+		if showTokens && !dryRun {
 			var err error
 			tokenizer, err = tiktoken.EncodingForModel(tokensModel)
 			if err != nil {
@@ -278,7 +378,6 @@ subdirectories and their contents for each provided directory.`,
 			}
 		}
 
-		fileHashes := make(map[string]*FileHash)
 		var output strings.Builder
 
 		// Create a root entry that will contain all directories
@@ -294,7 +393,13 @@ subdirectories and their contents for each provided directory.`,
 			if err != nil {
 				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
 			}
-			dirEntry, err := loadDirectory(dir, filter, tokenizer)
+
+			var dirEntry *FileEntry
+			if dryRun {
+				dirEntry, err = loadDirectoryDryRun(dir, filter)
+			} else {
+				dirEntry, err = loadDirectory(dir, filter, tokenizer)
+			}
 			if err != nil {
 				return fmt.Errorf("failed to load directory structure for %s: %w", dir, err)
 			}
@@ -302,6 +407,20 @@ subdirectories and their contents for each provided directory.`,
 				continue
 			}
 			root.Children = append(root.Children, dirEntry)
+		}
+
+		if dryRun {
+			// Dry-run mode: just list the files that would be included
+			output.WriteString(fmt.Sprintf("Files that would be included in flatten output:\n\n"))
+			output.WriteString(fmt.Sprintf("Total files: %d\n", getTotalFiles(root)))
+			if showTotalSize {
+				output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
+			}
+			output.WriteString(fmt.Sprintf("\nDirectory structure:\n%s\n", renderDirTree(root, "", false, false)))
+			output.WriteString("Files:\n")
+			printDryRunOutput(root, &output)
+			fmt.Print(output.String())
+			return nil
 		}
 
 		if showTokens {
@@ -314,7 +433,15 @@ subdirectories and their contents for each provided directory.`,
 			output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
 		}
 		output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTree(root, "", false, showTokens)))
-		printFlattenedOutput(root, &output, fileHashes, showTokens)
+
+		// Determine the markdown delimiter
+		delimiter := markdownDelimiter
+		if delimiter == "auto" {
+			delimiter = detectBestDelimiter(root)
+		}
+
+		fileHashes := make(map[string]*FileHash)
+		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter)
 
 		fmt.Print(output.String())
 		return nil
@@ -343,6 +470,9 @@ func init() {
 
 	rootCmd.Flags().StringSliceVarP(&includePatterns, "include", "I", []string{}, "Include only files matching these patterns (e.g. '*.go,*.js')")
 	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "E", []string{}, "Exclude files matching these patterns (e.g. '*.test.js')")
+
+	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, ```, ~~~, `````, ~~~~~, ~~~~~~~~~~~)")
+	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "List all files that would be included without processing content")
 }
 
 func main() {
