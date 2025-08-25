@@ -70,6 +70,10 @@ var (
 
 	// commands to run after flattening
 	commands []string
+
+	// Optional surrounding messages
+	prefixMessage string
+	suffixMessage string
 )
 
 // Available markdown delimiters in order of preference for auto-detection
@@ -375,6 +379,22 @@ func runCommands(cmds []string) []CommandResult {
 	return results
 }
 
+// printFinalOutput prints the final content to stdout, optionally
+// surrounding it with prefix/suffix blocks delimited by --- lines.
+func printFinalOutput(content string, prefix, suffix string) {
+	if strings.TrimSpace(prefix) != "" {
+		fmt.Println("---")
+		fmt.Println(prefix)
+		fmt.Println("---")
+	}
+	fmt.Print(content)
+	if strings.TrimSpace(suffix) != "" {
+		fmt.Println("---")
+		fmt.Println(suffix)
+		fmt.Println("---")
+	}
+}
+
 func printDryRunOutput(entry *FileEntry, w *strings.Builder) {
 	if !entry.IsDir {
 		w.WriteString(fmt.Sprintf("%s\n", entry.Path))
@@ -472,7 +492,7 @@ subdirectories and their contents for each provided directory.`,
 			output.WriteString(fmt.Sprintf("\nDirectory structure:\n%s\n", renderDirTree(root, "", false, false)))
 			output.WriteString("Files:\n")
 			printDryRunOutput(root, &output)
-			fmt.Print(output.String())
+			printFinalOutput(output.String(), prefixMessage, suffixMessage)
 			return nil
 		}
 
@@ -519,7 +539,7 @@ subdirectories and their contents for each provided directory.`,
 			}
 		}
 
-		fmt.Print(output.String())
+		printFinalOutput(output.String(), prefixMessage, suffixMessage)
 		return nil
 	},
 }
@@ -552,6 +572,10 @@ func init() {
 
 	// Allow specifying any number of commands. Each --command is executed after flattening.
 	rootCmd.Flags().StringArrayVar(&commands, "command", []string{}, "Command to run after flattening (can be repeated)")
+
+	// Optional prefix/suffix wrappers
+	rootCmd.Flags().StringVar(&prefixMessage, "prefix", "", "Optional message printed before output, wrapped by --- lines")
+	rootCmd.Flags().StringVar(&suffixMessage, "suffix", "", "Optional message printed after output, wrapped by --- lines")
 }
 
 func main() {

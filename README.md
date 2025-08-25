@@ -103,6 +103,8 @@ Flags:
       --include-locks       Include lock files (package-lock.json, yarn.lock, etc.)
   -l, --last-updated        Show last updated time for each file
       --no-dedup            Disable file deduplication
+      --prefix              Optional message printed before output, wrapped by --- lines
+      --suffix              Optional message printed after output, wrapped by --- lines
   -c, --show-checksum       Show SHA256 checksum of files
   -t, --show-mime           Show file MIME types
   -m, --show-mode           Show file permissions
@@ -120,6 +122,27 @@ Flags:
 Examples:
 - `flatten . --command "go test ./..." --command "git status --porcelain"`
 - `flatten repoA repoB --command "ls -la"`
+
+### Optional Output Wrapping
+Use `--prefix` and/or `--suffix` to add custom messages around the entire output. When provided, each is wrapped by delimiter lines `---` to make them easy to spot.
+
+Example:
+
+```
+flatten . --prefix "Start of snapshot" --suffix "End of snapshot"
+```
+
+This prints:
+
+```
+---
+Start of snapshot
+---
+...<flatten output here>...
+---
+End of snapshot
+---
+```
 
 ## License
 MIT License
