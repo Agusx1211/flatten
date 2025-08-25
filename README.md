@@ -106,10 +106,13 @@ Flags:
       --prefix              Optional message printed before output, wrapped by --- lines
       --suffix              Optional message printed after output, wrapped by --- lines
   -c, --show-checksum       Show SHA256 checksum of files
-  -t, --show-mime           Show file MIME types
+  -M, --show-mime           Show file MIME types
   -m, --show-mode           Show file permissions
   -o, --show-owner          Show file owner and group
   -z, --show-size           Show individual file sizes
+  -Z, --show-total-size     Show total size of all files
+  -t, --tokens              Show token usage for each file/directory
+      --tokens-model        Model to use for token counting
   -y, --show-symlinks       Show symlink targets
   -h, --help                Help for flatten
   -I, --include             Include only files matching these patterns (e.g. '*.go,*.js')
