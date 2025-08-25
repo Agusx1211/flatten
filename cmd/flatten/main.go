@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -64,6 +67,9 @@ var (
 
 	markdownDelimiter string
 	dryRun            bool
+
+	// commands to run after flattening
+	commands []string
 )
 
 // Available markdown delimiters in order of preference for auto-detection
@@ -322,6 +328,53 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 	}
 }
 
+// CommandResult captures the outcome of running a single shell command
+type CommandResult struct {
+	Command   string
+	StartTime time.Time
+	EndTime   time.Time
+	Duration  time.Duration
+	ExitCode  int
+	Stdout    string
+	Stderr    string
+}
+
+func buildShellCommand(command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/C", command)
+	}
+	return exec.Command("sh", "-c", command)
+}
+
+func runCommands(cmds []string) []CommandResult {
+	results := make([]CommandResult, 0, len(cmds))
+	for _, c := range cmds {
+		cmd := buildShellCommand(c)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		start := time.Now()
+		err := cmd.Run()
+		end := time.Now()
+		exitCode := 0
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		} else if err != nil {
+			exitCode = 1
+		}
+		results = append(results, CommandResult{
+			Command:   c,
+			StartTime: start,
+			EndTime:   end,
+			Duration:  end.Sub(start),
+			ExitCode:  exitCode,
+			Stdout:    stdout.String(),
+			Stderr:    stderr.String(),
+		})
+	}
+	return results
+}
+
 func printDryRunOutput(entry *FileEntry, w *strings.Builder) {
 	if !entry.IsDir {
 		w.WriteString(fmt.Sprintf("%s\n", entry.Path))
@@ -443,6 +496,29 @@ subdirectories and their contents for each provided directory.`,
 		fileHashes := make(map[string]*FileHash)
 		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter)
 
+		// If commands were requested, run them and append a detailed report
+		if len(commands) > 0 {
+			output.WriteString("\nCommands execution:\n")
+			results := runCommands(commands)
+			for _, r := range results {
+				output.WriteString(fmt.Sprintf("\n- command: %s\n", r.Command))
+				output.WriteString(fmt.Sprintf("- started: %s\n", r.StartTime.Format(time.RFC3339Nano)))
+				output.WriteString(fmt.Sprintf("- finished: %s\n", r.EndTime.Format(time.RFC3339Nano)))
+				output.WriteString(fmt.Sprintf("- duration: %s\n", r.Duration))
+				output.WriteString(fmt.Sprintf("- exit-code: %d\n", r.ExitCode))
+				if r.Stdout != "" {
+					output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, r.Stdout, delimiter))
+				} else {
+					output.WriteString("- stdout: (empty)\n")
+				}
+				if r.Stderr != "" {
+					output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, r.Stderr, delimiter))
+				} else {
+					output.WriteString("- stderr: (empty)\n")
+				}
+			}
+		}
+
 		fmt.Print(output.String())
 		return nil
 	},
@@ -473,6 +549,9 @@ func init() {
 
 	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, ```, ~~~, `````, ~~~~~, ~~~~~~~~~~~)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "List all files that would be included without processing content")
+
+	// Allow specifying any number of commands. Each --command is executed after flattening.
+	rootCmd.Flags().StringArrayVar(&commands, "command", []string{}, "Command to run after flattening (can be repeated)")
 }
 
 func main() {

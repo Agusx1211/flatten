@@ -114,6 +114,13 @@ Flags:
   -E, --exclude             Exclude files matching these patterns (e.g. '*.test.js')
 ```
 
+### Running Commands After Flattening
+- `--command`: Command to run after flattening (can be repeated). Each command runs in the current working directory, and its start/end time, duration, exit code, stdout, and stderr are appended to the end of the flatten output.
+
+Examples:
+- `flatten . --command "go test ./..." --command "git status --porcelain"`
+- `flatten repoA repoB --command "ls -la"`
+
 ## License
 MIT License
 

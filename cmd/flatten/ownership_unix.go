@@ -16,7 +16,7 @@ func getOwnershipInfo(path string, w *strings.Builder) {
 	if err != nil {
 		return
 	}
-	
+
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		if owner, err := user.LookupId(fmt.Sprint(stat.Uid)); err == nil {
 			w.WriteString(fmt.Sprintf("- owner: %s\n", owner.Username))
