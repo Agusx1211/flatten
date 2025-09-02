@@ -48,7 +48,7 @@ jobs:
       run: ./build.sh $VERSION
 
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: flatten-binaries
         path: build/*
@@ -61,11 +61,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Prepare release assets
-      run: |
-        mkdir -p release-assets
-        cp build/* release-assets/ 2>/dev/null || true
-        ls -la release-assets/
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: flatten-binaries
+        path: release-assets
+
+    - name: List release assets
+      run: ls -la release-assets/
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
