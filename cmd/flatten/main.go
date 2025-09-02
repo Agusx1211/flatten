@@ -379,19 +379,28 @@ func runCommands(cmds []string) []CommandResult {
 	return results
 }
 
-// printFinalOutput prints the final content to stdout, optionally
-// surrounding it with prefix/suffix blocks delimited by --- lines.
+// printFinalOutput prints optional prefix, then wraps only the main content
+// with --- lines, and finally prints optional suffix. If either prefix or
+// suffix is provided, the content is surrounded by --- lines. The prefix has
+// --- only after it; the suffix has --- only before it.
 func printFinalOutput(content string, prefix, suffix string) {
-	if strings.TrimSpace(prefix) != "" {
-		fmt.Println("---")
+	hasPrefix := strings.TrimSpace(prefix) != ""
+	hasSuffix := strings.TrimSpace(suffix) != ""
+
+	if hasPrefix {
 		fmt.Println(prefix)
+	}
+	if hasPrefix || hasSuffix {
 		fmt.Println("---")
 	}
+
 	fmt.Print(content)
-	if strings.TrimSpace(suffix) != "" {
+
+	if hasPrefix || hasSuffix {
 		fmt.Println("---")
+	}
+	if hasSuffix {
 		fmt.Println(suffix)
-		fmt.Println("---")
 	}
 }
 
