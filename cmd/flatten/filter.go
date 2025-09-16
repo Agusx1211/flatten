@@ -4,9 +4,11 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
+	doublestar "github.com/bmatcuk/doublestar/v4"
 	ignore "github.com/sabhiram/go-gitignore"
 )
 
@@ -18,13 +20,17 @@ type Filter struct {
 	includeBin      bool
 	includeLocks    bool
 	baseDir         string
-	includePatterns []string
-	excludePatterns []string
-	excludedDirs    []string
+	includePatterns []globPattern
+	excludePatterns []globPattern
+}
+
+type globPattern struct {
+	pattern string
+	dirOnly bool
 }
 
 // NewFilter creates a new filter for the given directory.
-// Exclude patterns ending with "/" are treated as directory excludes; otherwise, file excludes.
+// Patterns support glob matching. Trailing slashes restrict a pattern to directories only.
 func NewFilter(
 	dir string,
 	includeGitIgnore bool,
@@ -34,17 +40,8 @@ func NewFilter(
 	includePatterns []string,
 	excludePatterns []string,
 ) (*Filter, error) {
-	var excludedDirs []string
-	var fileExcludePatterns []string
-
-	for _, pat := range excludePatterns {
-		if strings.HasSuffix(pat, "/") {
-			cleaned := strings.TrimSuffix(pat, "/")
-			excludedDirs = append(excludedDirs, cleaned)
-		} else {
-			fileExcludePatterns = append(fileExcludePatterns, pat)
-		}
-	}
+	compiledIncludes := compilePatterns(includePatterns)
+	compiledExcludes := compilePatterns(excludePatterns)
 
 	f := &Filter{
 		includeAll:      includeGitIgnore,
@@ -52,9 +49,8 @@ func NewFilter(
 		includeBin:      includeBin,
 		includeLocks:    includeLocks,
 		baseDir:         dir,
-		includePatterns: includePatterns,
-		excludePatterns: fileExcludePatterns,
-		excludedDirs:    excludedDirs,
+		includePatterns: compiledIncludes,
+		excludePatterns: compiledExcludes,
 	}
 
 	if !includeGitIgnore {
@@ -73,24 +69,25 @@ func NewFilter(
 
 // ShouldInclude returns true if the file/directory should be included
 func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
-	if info.IsDir() && f.isExcludedDir(path) {
+	relPath := f.relativePath(path)
+	isDir := info.IsDir()
+
+	if f.matchesPatterns(relPath, isDir, f.excludePatterns) {
 		return false
 	}
 
-	if !info.IsDir() {
+	if !isDir {
 		if len(f.includePatterns) > 0 {
-			if !f.matchesAnyPattern(path, f.includePatterns) {
+			if !f.matchesPatterns(relPath, false, f.includePatterns) {
 				return false
 			}
-		}
-		if f.matchesAnyPattern(path, f.excludePatterns) {
-			return false
 		}
 	}
 
 	if !f.includeGit {
+		relSlash := filepath.ToSlash(relPath)
 		base := filepath.Base(path)
-		if base == ".git" || strings.Contains(filepath.ToSlash(path), "/.git/") {
+		if base == ".git" || relSlash == ".git" || strings.Contains(relSlash, "/.git/") {
 			return false
 		}
 	}
@@ -117,27 +114,11 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		return true
 	}
 
-	relPath, err := filepath.Rel(f.baseDir, path)
-	if err != nil {
+	if relPath == "." {
 		return true
 	}
-	relPath = filepath.ToSlash(relPath)
+
 	return !f.gitIgnore.MatchesPath(relPath)
-}
-
-func (f *Filter) isExcludedDir(path string) bool {
-	rel, err := filepath.Rel(f.baseDir, path)
-	if err != nil {
-		return false
-	}
-	rel = filepath.ToSlash(rel)
-
-	for _, dir := range f.excludedDirs {
-		if rel == dir || strings.HasPrefix(rel, dir+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 func (f *Filter) isBinaryFile(path string) (bool, error) {
@@ -189,17 +170,93 @@ func (f *Filter) isBinaryFile(path string) (bool, error) {
 	return !strings.HasPrefix(contentType, "text/"), nil
 }
 
-func (f *Filter) matchesAnyPattern(path string, patterns []string) bool {
+func (f *Filter) matchesPatterns(relPath string, isDir bool, patterns []globPattern) bool {
 	if len(patterns) == 0 {
 		return false
 	}
+
+	normalized := strings.ReplaceAll(relPath, "\\", "/")
+	base := path.Base(normalized)
+	if base == "." && normalized != "." {
+		// path.Base returns "." for trailing slash; fallback to last segment manually
+		if idx := strings.LastIndex(normalized, "/"); idx >= 0 && idx < len(normalized)-1 {
+			base = normalized[idx+1:]
+		}
+	}
+
 	for _, pattern := range patterns {
-		matched, err := filepath.Match(pattern, filepath.Base(path))
-		if err == nil && matched {
+		if pattern.pattern == "" {
+			if pattern.dirOnly {
+				if isDir {
+					return true
+				}
+				continue
+			}
+			if normalized == "" || normalized == "." {
+				return true
+			}
+		}
+		if pattern.dirOnly && !isDir {
+			continue
+		}
+		if matchGlob(pattern.pattern, normalized) {
+			return true
+		}
+		if base != normalized && matchGlob(pattern.pattern, base) {
 			return true
 		}
 	}
 	return false
+}
+
+func (f *Filter) relativePath(path string) string {
+	rel, err := filepath.Rel(f.baseDir, path)
+	if err != nil {
+		return filepath.ToSlash(path)
+	}
+	if rel == "." {
+		return "."
+	}
+	return filepath.ToSlash(rel)
+}
+
+func matchGlob(pattern, target string) bool {
+	matched, err := doublestar.PathMatch(pattern, target)
+	return err == nil && matched
+}
+
+func compilePatterns(patterns []string) []globPattern {
+	result := make([]globPattern, 0, len(patterns))
+	for _, raw := range patterns {
+		pat := normalizePattern(raw)
+		if pat.pattern == "" && !pat.dirOnly {
+			continue
+		}
+		result = append(result, pat)
+	}
+	return result
+}
+
+func normalizePattern(raw string) globPattern {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return globPattern{}
+	}
+	trimmed = strings.ReplaceAll(trimmed, "\\", "/")
+	for strings.HasPrefix(trimmed, "./") {
+		trimmed = strings.TrimPrefix(trimmed, "./")
+	}
+	dirOnly := false
+	for strings.HasSuffix(trimmed, "/") {
+		dirOnly = true
+		trimmed = strings.TrimSuffix(trimmed, "/")
+	}
+	normalized := path.Clean(trimmed)
+	if normalized == "." {
+		normalized = ""
+	}
+	normalized = strings.TrimPrefix(normalized, "/")
+	return globPattern{pattern: normalized, dirOnly: dirOnly}
 }
 
 // isLockFile checks if a file is a lock file
