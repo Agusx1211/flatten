@@ -74,6 +74,9 @@ var (
 	// Optional surrounding messages
 	prefixMessage string
 	suffixMessage string
+
+	// Output compression
+	compressOutput bool
 )
 
 // Available markdown delimiters in order of preference for auto-detection
@@ -278,7 +281,176 @@ func calculateFileHash(content []byte) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string) {
+// --- Compression helpers ---
+
+// BlobDef represents a large repeated blob extracted out of the content
+type BlobDef struct {
+	ID      string
+	Hash    string
+	Content string
+	Count   int
+}
+
+// CompressionContext carries configuration and runtime state for compression
+type CompressionContext struct {
+	Enabled     bool
+	BlobsByID   map[string]*BlobDef
+	BlobsByHash map[string]*BlobDef
+	UsedBlobIDs map[string]bool
+	Applied     bool
+}
+
+const largeBlobThresholdBytes = 1024 // "sane" threshold for large repeated blobs
+const maxRepeatGroupLines = 16        // max group size to detect repeated line blocks
+
+// buildLargeBlobIndex walks all files and collects large repeated paragraphs across files
+func buildLargeBlobIndex(entry *FileEntry, idx map[string]*BlobDef) {
+	if entry == nil {
+		return
+	}
+	if !entry.IsDir {
+		if len(entry.Content) == 0 {
+			return
+		}
+		content := string(entry.Content)
+		paragraphs := extractLargeParagraphs(content, largeBlobThresholdBytes)
+		for _, p := range paragraphs {
+			h := calculateFileHash([]byte(p))
+			if existing, ok := idx[h]; ok {
+				existing.Count++
+			} else {
+				idx[h] = &BlobDef{ID: "", Hash: h, Content: p, Count: 1}
+			}
+		}
+		return
+	}
+	for _, child := range entry.Children {
+		buildLargeBlobIndex(child, idx)
+	}
+}
+
+// finalizeBlobIDs filters blobs that meet the repetition threshold and assigns stable IDs
+func finalizeBlobIDs(idx map[string]*BlobDef) (map[string]*BlobDef, map[string]*BlobDef) {
+	blobsByID := make(map[string]*BlobDef)
+	blobsByHash := make(map[string]*BlobDef)
+	for hash, def := range idx {
+		if def.Count >= 2 && len(def.Content) >= largeBlobThresholdBytes {
+			id := "blob-" + hash[:8]
+			def.ID = id
+			blobsByID[id] = def
+			blobsByHash[hash] = def
+		}
+	}
+	return blobsByID, blobsByHash
+}
+
+// extractLargeParagraphs splits content into paragraphs separated by blank lines
+// and returns only those whose byte length >= threshold.
+func extractLargeParagraphs(s string, threshold int) []string {
+	lines := strings.Split(s, "\n")
+	var paragraphs []string
+	var current strings.Builder
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" { // blank line denotes paragraph boundary
+			if current.Len() > 0 {
+				para := current.String()
+				if len(para) >= threshold {
+					paragraphs = append(paragraphs, para)
+				}
+				current.Reset()
+			}
+			// keep blank line inside the paragraph boundaries as separator
+			continue
+		}
+		current.WriteString(line)
+		// re-add newline if not last line to preserve exact paragraph text
+		if i < len(lines)-1 {
+			current.WriteString("\n")
+		}
+	}
+	if current.Len() > 0 {
+		para := current.String()
+		if len(para) >= threshold {
+			paragraphs = append(paragraphs, para)
+		}
+	}
+	return paragraphs
+}
+
+// replaceLargeBlobs substitutes any known large repeated blob occurrences with a placeholder
+func replaceLargeBlobs(s string, ctx *CompressionContext) (string, bool) {
+	if ctx == nil || !ctx.Enabled || len(ctx.BlobsByID) == 0 {
+		return s, false
+	}
+	changed := false
+	result := s
+	for id, blob := range ctx.BlobsByID {
+		placeholder := "<<<" + id + ">>>"
+		if strings.Contains(result, blob.Content) {
+			result = strings.ReplaceAll(result, blob.Content, placeholder)
+			ctx.UsedBlobIDs[id] = true
+			changed = true
+		}
+	}
+	return result, changed
+}
+
+// compressRepeatedBlocks detects consecutive repeated blocks of up to maxRepeatGroupLines lines
+// and collapses them to a single block plus an annotation line.
+func compressRepeatedBlocks(s string) (string, bool) {
+	lines := strings.Split(s, "\n")
+	if len(lines) == 0 {
+		return s, false
+	}
+	var out []string
+	changed := false
+	for i := 0; i < len(lines); {
+		remaining := len(lines) - i
+		groupMax := maxRepeatGroupLines
+		if remaining < groupMax {
+			groupMax = remaining
+		}
+		compressedHere := false
+		for groupSize := groupMax; groupSize >= 1; groupSize-- {
+			if i+groupSize > len(lines) {
+				continue
+			}
+			block := lines[i : i+groupSize]
+			repeats := 1
+			j := i + groupSize
+			for j+groupSize <= len(lines) {
+				candidate := lines[j : j+groupSize]
+				match := true
+				for k := 0; k < groupSize; k++ {
+					if candidate[k] != block[k] {
+						match = false
+						break
+					}
+				}
+				if !match {
+					break
+				}
+				repeats++
+				j += groupSize
+			}
+			if repeats >= 2 {
+				out = append(out, block...)
+				out = append(out, fmt.Sprintf("(...<<<repeats %d times, %d lines>>>...)", repeats, groupSize))
+				i = i + repeats*groupSize
+				changed = true
+				compressedHere = true
+				break
+			}
+		}
+		if !compressedHere {
+			out = append(out, lines[i])
+			i++
+		}
+	}
+	return strings.Join(out, "\n"), changed
+}
+
+func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string, compCtx *CompressionContext) {
 	if !entry.IsDir {
 		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 		if showAllMetadata || showLastUpdated {
@@ -310,16 +482,28 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 		if showTokens {
 			w.WriteString(fmt.Sprintf("- tokens: %d\n", entry.Tokens))
 		}
+		contentStr := string(entry.Content)
+		// Apply compression strategies when enabled
+		if compCtx != nil && compCtx.Enabled {
+			if replaced, changed := replaceLargeBlobs(contentStr, compCtx); changed {
+				contentStr = replaced
+				compCtx.Applied = true
+			}
+			if compressed, changed := compressRepeatedBlocks(contentStr); changed {
+				contentStr = compressed
+				compCtx.Applied = true
+			}
+		}
 		if noFileDeduplication {
-			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, string(entry.Content), delimiter))
+			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
 			return
 		}
-		hash := calculateFileHash(entry.Content)
+		hash := calculateFileHash([]byte(contentStr))
 		if existing, exists := fileHashes[hash]; exists {
 			w.WriteString(fmt.Sprintf("- content: Contents are identical to %s\n", existing.Path))
 		} else {
-			fileHashes[hash] = &FileHash{Path: entry.Path, Hash: hash, Content: entry.Content}
-			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, string(entry.Content), delimiter))
+			fileHashes[hash] = &FileHash{Path: entry.Path, Hash: hash, Content: []byte(contentStr)}
+			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
 		}
 		return
 	}
@@ -328,7 +512,7 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 		w.WriteString(fmt.Sprintf("- dir tokens: %d\n", entry.Tokens))
 	}
 	for _, child := range entry.Children {
-		printFlattenedOutput(child, w, fileHashes, showTokens, delimiter)
+		printFlattenedOutput(child, w, fileHashes, showTokens, delimiter, compCtx)
 	}
 }
 
@@ -523,32 +707,121 @@ subdirectories and their contents for each provided directory.`,
 		}
 
 		fileHashes := make(map[string]*FileHash)
-		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter)
+
+		// If commands were requested, run them now so their outputs can be included
+		// in compression blob indexing while preserving the final print order below.
+		var cmdResults []CommandResult
+		if len(commands) > 0 {
+			cmdResults = runCommands(commands)
+		}
+
+		// Prepare compression context when enabled
+		var compCtx *CompressionContext
+		if compressOutput {
+			// build global index for large repeated blobs across files and command outputs
+			tempIdx := make(map[string]*BlobDef)
+			buildLargeBlobIndex(root, tempIdx)
+			// include command outputs in the blob index
+			for _, r := range cmdResults {
+				for _, block := range extractLargeParagraphs(r.Stdout, largeBlobThresholdBytes) {
+					h := calculateFileHash([]byte(block))
+					if existing, ok := tempIdx[h]; ok {
+						existing.Count++
+					} else {
+						tempIdx[h] = &BlobDef{ID: "", Hash: h, Content: block, Count: 1}
+					}
+				}
+				for _, block := range extractLargeParagraphs(r.Stderr, largeBlobThresholdBytes) {
+					h := calculateFileHash([]byte(block))
+					if existing, ok := tempIdx[h]; ok {
+						existing.Count++
+					} else {
+						tempIdx[h] = &BlobDef{ID: "", Hash: h, Content: block, Count: 1}
+					}
+				}
+			}
+			blobsByID, blobsByHash := finalizeBlobIDs(tempIdx)
+			compCtx = &CompressionContext{
+				Enabled:     true,
+				BlobsByID:   blobsByID,
+				BlobsByHash: blobsByHash,
+				UsedBlobIDs: make(map[string]bool),
+			}
+		}
+
+		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter, compCtx)
 
 		// If commands were requested, run them and append a detailed report
 		if len(commands) > 0 {
 			output.WriteString("\nCommands execution:\n")
-			results := runCommands(commands)
-			for _, r := range results {
+			for _, r := range cmdResults {
 				output.WriteString(fmt.Sprintf("\n- command: %s\n", r.Command))
 				output.WriteString(fmt.Sprintf("- started: %s\n", r.StartTime.Format(time.RFC3339Nano)))
 				output.WriteString(fmt.Sprintf("- finished: %s\n", r.EndTime.Format(time.RFC3339Nano)))
 				output.WriteString(fmt.Sprintf("- duration: %s\n", r.Duration))
 				output.WriteString(fmt.Sprintf("- exit-code: %d\n", r.ExitCode))
 				if r.Stdout != "" {
-					output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, r.Stdout, delimiter))
+					stdoutStr := r.Stdout
+					if compCtx != nil && compCtx.Enabled {
+						if replaced, changed := replaceLargeBlobs(stdoutStr, compCtx); changed {
+							stdoutStr = replaced
+							compCtx.Applied = true
+						}
+						if compressed, changed := compressRepeatedBlocks(stdoutStr); changed {
+							stdoutStr = compressed
+							compCtx.Applied = true
+						}
+					}
+					output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, stdoutStr, delimiter))
 				} else {
 					output.WriteString("- stdout: (empty)\n")
 				}
 				if r.Stderr != "" {
-					output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, r.Stderr, delimiter))
+					stderrStr := r.Stderr
+					if compCtx != nil && compCtx.Enabled {
+						if replaced, changed := replaceLargeBlobs(stderrStr, compCtx); changed {
+							stderrStr = replaced
+							compCtx.Applied = true
+						}
+						if compressed, changed := compressRepeatedBlocks(stderrStr); changed {
+							stderrStr = compressed
+							compCtx.Applied = true
+						}
+					}
+					output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, stderrStr, delimiter))
 				} else {
 					output.WriteString("- stderr: (empty)\n")
 				}
 			}
 		}
 
-		printFinalOutput(output.String(), prefixMessage, suffixMessage)
+		// If compression applied, prepend a tiny legend and append extracted blobs
+		finalStr := output.String()
+		if compCtx != nil && compCtx.Applied {
+			var legend strings.Builder
+			legend.WriteString("Compression applied:\n")
+			legend.WriteString("- Repeated lines/groups shown once + (...<<<repeats N times>>>...)\n")
+			legend.WriteString("- Large repeated blobs replaced with <<<blob-id>>> and listed at end\n\n")
+			// Append blobs section only for used IDs
+			var blobsSection strings.Builder
+			blobsSection.WriteString("\nExtracted blobs:\n")
+			anyBlob := false
+			for id := range compCtx.UsedBlobIDs {
+				if def, ok := compCtx.BlobsByID[id]; ok {
+					anyBlob = true
+					blobsSection.WriteString(fmt.Sprintf("\n- id: %s\n", id))
+					blobsSection.WriteString("- content:\n")
+					blobsSection.WriteString(fmt.Sprintf("%s\n%s\n%s\n", delimiter, def.Content, delimiter))
+				}
+			}
+			if anyBlob {
+				finalStr = legend.String() + finalStr + blobsSection.String()
+			} else {
+				finalStr = legend.String() + finalStr
+			}
+		}
+
+		printFinalOutput(finalStr, prefixMessage, suffixMessage)
 		return nil
 	},
 }
@@ -578,6 +851,9 @@ func init() {
 
 	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, ```, ~~~, `````, ~~~~~, ~~~~~~~~~~~)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "List all files that would be included without processing content")
+
+	// Output compression flag (disabled by default)
+	rootCmd.Flags().BoolVar(&compressOutput, "compress", false, "Compress output by collapsing repeats and extracting large repeated blobs")
 
 	// Allow specifying any number of commands. Each --command is executed after flattening.
 	rootCmd.Flags().StringArrayVar(&commands, "command", []string{}, "Command to run after flattening (can be repeated)")

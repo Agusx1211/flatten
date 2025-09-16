@@ -9,6 +9,12 @@ Flatten is a CLI tool that takes a directory as input and outputs a flat represe
 ## Features
 You can toggle metadata details like last modified time, file permissions, sizes, checksums, and more. You can also include or exclude certain special files or directories with options like `--include-git`, `--include-gitignore`, or `--include-bin` if you want your binary files included.
 
+### Optional Output Compression (experimental)
+- `--compress`: When enabled, output is post-processed to reduce redundancy, while remaining human-readable.
+  - Repeated lines or small groups repeated consecutively are collapsed: they are shown once followed by a small marker, for example `(...<<<repeats N times>>>...)`.
+  - Large blobs of text that repeat in multiple places (detected as large paragraphs) are extracted and replaced by placeholders like `<<<blob-XXXXXXXX>>>`. The full blob contents are appended at the end of the output under an "Extracted blobs" section.
+  - A brief legend is added at the top indicating the two compression behaviors when compression was actually applied.
+
 ## Installation
 
 ### Pre-built Binaries
@@ -111,6 +117,7 @@ Flags:
   -o, --show-owner          Show file owner and group
   -z, --show-size           Show individual file sizes
   -Z, --show-total-size     Show total size of all files
+      --compress            Compress output by collapsing repeats and extracting large repeated blobs
   -t, --tokens              Show token usage for each file/directory
       --tokens-model        Model to use for token counting
   -y, --show-symlinks       Show symlink targets
