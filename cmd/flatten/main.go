@@ -91,6 +91,7 @@ var (
 
 	// Output compression
 	compressOutput bool
+	compressLevel  int
 )
 
 // Available markdown delimiters in order of preference for auto-detection
@@ -399,19 +400,372 @@ type BlobDef struct {
 
 // CompressionContext carries configuration and runtime state for compression
 type CompressionContext struct {
+	Level       int
+	BlobMinHits int
+
+	// Lossy transforms (progressively more aggressive by level)
+	TrimTrailingWhitespace bool
+	StripBlankLines        bool
+	StripCommentLines      bool
+
+	// Blob extraction
+	LargeBlobThresholdBytes int
+	HeaderBlobMinBytes      int
+	HeaderBlobMaxBytes      int
+	HeaderBlobMaxLines      int
+
+	// Repeated-block compression
+	MaxRepeatGroupLines int
+
+	// Truncation (level 3+). If either min threshold is exceeded, output is truncated.
+	TruncateMinBytes  int
+	TruncateMinLines  int
+	TruncateHead      int
+	TruncateTail      int
+	TruncateHeadBytes int
+	TruncateTailBytes int
+
 	Enabled     bool
 	BlobsByID   map[string]*BlobDef
 	BlobsByHash map[string]*BlobDef
 	BlobIDs     []string
 	UsedBlobIDs map[string]bool
 	Applied     bool
+
+	AppliedBlobs      bool
+	AppliedRepeats    bool
+	AppliedTruncation bool
+	AppliedWhitespace bool
+	AppliedComments   bool
+	AppliedOutline    bool
 }
 
-const largeBlobThresholdBytes = 1024 // "sane" threshold for large repeated blobs
-const maxRepeatGroupLines = 16       // max group size to detect repeated line blocks
+func newCompressionContext(level int) (*CompressionContext, error) {
+	if level <= 0 {
+		return nil, nil
+	}
+	if level > 3 {
+		return nil, fmt.Errorf("invalid compression level %d (must be 1..3)", level)
+	}
 
-// buildLargeBlobIndex walks all files and collects large repeated paragraphs across files
-func buildLargeBlobIndex(entry *FileEntry, idx map[string]*BlobDef) {
+	ctx := &CompressionContext{
+		Enabled:     true,
+		Level:       level,
+		UsedBlobIDs: make(map[string]bool),
+	}
+
+	switch level {
+	case 1:
+		ctx.TrimTrailingWhitespace = true
+		ctx.StripBlankLines = true
+		ctx.BlobMinHits = 2
+		ctx.LargeBlobThresholdBytes = 1024
+		ctx.MaxRepeatGroupLines = 16
+	case 2:
+		ctx.TrimTrailingWhitespace = true
+		ctx.StripBlankLines = true
+		ctx.StripCommentLines = true
+		ctx.BlobMinHits = 2
+		ctx.LargeBlobThresholdBytes = 512
+		ctx.MaxRepeatGroupLines = 32
+		// Helps extract repeated license headers/boilerplate.
+		ctx.HeaderBlobMinBytes = 256
+		ctx.HeaderBlobMaxBytes = 4096
+		ctx.HeaderBlobMaxLines = 80
+	case 3:
+		ctx.TrimTrailingWhitespace = true
+		ctx.StripBlankLines = true
+		ctx.StripCommentLines = true
+		ctx.BlobMinHits = 2
+		ctx.LargeBlobThresholdBytes = 256
+		ctx.MaxRepeatGroupLines = 64
+		// Slightly more permissive header extraction.
+		ctx.HeaderBlobMinBytes = 192
+		ctx.HeaderBlobMaxBytes = 8192
+		ctx.HeaderBlobMaxLines = 120
+
+		// Aggressive truncation for large blocks (lossy).
+		ctx.TruncateMinBytes = 16 * 1024
+		ctx.TruncateMinLines = 200
+		ctx.TruncateHead = 80
+		ctx.TruncateTail = 40
+		ctx.TruncateHeadBytes = 4096
+		ctx.TruncateTailBytes = 2048
+	}
+
+	return ctx, nil
+}
+
+func minNonZero(a, b int) int {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 {
+		return a
+	}
+	if a < b {
+		return a
+	}
+	return b
+}
+
+type compressionTextKind int
+
+const (
+	compressionTextFile compressionTextKind = iota
+	compressionTextCommand
+)
+
+type commentStyle struct {
+	LinePrefixes []string
+	BlockStart   string
+	BlockEnd     string
+}
+
+func (cs commentStyle) empty() bool {
+	return len(cs.LinePrefixes) == 0 && cs.BlockStart == "" && cs.BlockEnd == ""
+}
+
+func commentStyleForPath(path string) commentStyle {
+	base := filepath.Base(path)
+	ext := strings.ToLower(filepath.Ext(base))
+	lowerBase := strings.ToLower(base)
+
+	switch ext {
+	// C/Java/Go-style comments
+	case ".go", ".js", ".jsx", ".ts", ".tsx", ".java", ".c", ".cc", ".cpp", ".h", ".hh", ".hpp", ".cs", ".rs", ".swift", ".kt", ".kts":
+		return commentStyle{LinePrefixes: []string{"//"}, BlockStart: "/*", BlockEnd: "*/"}
+	// Hash comments
+	case ".py", ".sh", ".bash", ".zsh", ".rb", ".pl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf":
+		return commentStyle{LinePrefixes: []string{"#"}}
+	// SQL-style
+	case ".sql":
+		return commentStyle{LinePrefixes: []string{"--"}, BlockStart: "/*", BlockEnd: "*/"}
+	// HTML-style (also common inside Markdown)
+	case ".html", ".htm", ".xml", ".svg", ".md":
+		return commentStyle{BlockStart: "<!--", BlockEnd: "-->"}
+	}
+
+	// Filenames without extensions
+	if lowerBase == "dockerfile" || strings.HasPrefix(lowerBase, "dockerfile.") {
+		return commentStyle{LinePrefixes: []string{"#"}}
+	}
+	if lowerBase == "makefile" || strings.HasSuffix(lowerBase, ".mk") {
+		return commentStyle{LinePrefixes: []string{"#"}}
+	}
+
+	return commentStyle{}
+}
+
+type lossyChanges struct {
+	Any        bool
+	Whitespace bool
+	Comments   bool
+}
+
+func containsCommentKeepKeyword(trimmed string) bool {
+	up := strings.ToUpper(trimmed)
+	return strings.Contains(up, "TODO") || strings.Contains(up, "FIXME") || strings.Contains(up, "BUG") || strings.Contains(up, "HACK") || strings.Contains(up, "XXX")
+}
+
+func applyLossyTransforms(s string, ctx *CompressionContext, kind compressionTextKind, pathHint string) (string, lossyChanges) {
+	if ctx == nil || !ctx.Enabled {
+		return s, lossyChanges{}
+	}
+
+	stripComments := ctx.StripCommentLines && kind == compressionTextFile
+	trimTrailing := ctx.TrimTrailingWhitespace
+	stripBlank := ctx.StripBlankLines
+
+	if !stripComments && !trimTrailing && !stripBlank {
+		return s, lossyChanges{}
+	}
+
+	cs := commentStyle{}
+	if stripComments {
+		cs = commentStyleForPath(pathHint)
+		if cs.empty() {
+			stripComments = false
+		}
+	}
+
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+
+	inBlock := false
+	changedWhitespace := false
+	changedComments := false
+
+	for i, line := range lines {
+		if trimTrailing {
+			trimmed := strings.TrimRight(line, " \t")
+			if trimmed != line {
+				changedWhitespace = true
+			}
+			line = trimmed
+		}
+
+		if stripComments && !cs.empty() {
+			droppedByComment := false
+		reprocess:
+			trimmed := strings.TrimSpace(line)
+			if inBlock {
+				endIdx := strings.Index(line, cs.BlockEnd)
+				if endIdx == -1 {
+					changedComments = true
+					continue
+				}
+
+				// Keep anything after the block comment end.
+				remainder := line[endIdx+len(cs.BlockEnd):]
+				inBlock = false
+				changedComments = true
+				if strings.TrimSpace(remainder) == "" {
+					continue
+				}
+				line = remainder
+				goto reprocess
+			}
+
+			if cs.BlockStart != "" && strings.HasPrefix(trimmed, cs.BlockStart) {
+				endIdx := strings.Index(line, cs.BlockEnd)
+				changedComments = true
+				if endIdx == -1 {
+					inBlock = true
+					continue
+				}
+				remainder := line[endIdx+len(cs.BlockEnd):]
+				if strings.TrimSpace(remainder) == "" {
+					continue
+				}
+				line = remainder
+				goto reprocess
+			}
+
+			for _, prefix := range cs.LinePrefixes {
+				if !strings.HasPrefix(trimmed, prefix) {
+					continue
+				}
+
+				// Preserve shebangs.
+				if prefix == "#" && i == 0 && strings.HasPrefix(trimmed, "#!") {
+					break
+				}
+
+				// Preserve Go build tags even when stripping comments (useful context).
+				if prefix == "//" && (strings.HasPrefix(trimmed, "//go:build") || strings.HasPrefix(trimmed, "// +build")) {
+					break
+				}
+
+				// Keep TODO/FIXME/etc. comments even in lossy modes.
+				if containsCommentKeepKeyword(trimmed) {
+					break
+				}
+
+				changedComments = true
+				droppedByComment = true
+				break
+			}
+			if droppedByComment {
+				continue
+			}
+		}
+
+		if stripBlank && strings.TrimSpace(line) == "" {
+			changedWhitespace = true
+			continue
+		}
+		out = append(out, line)
+	}
+
+	result := strings.Join(out, "\n")
+	if result == s {
+		return s, lossyChanges{}
+	}
+	return result, lossyChanges{
+		Any:        true,
+		Whitespace: changedWhitespace,
+		Comments:   changedComments,
+	}
+}
+
+func shouldCountHeaderLine(trimmed string, lineIndex int) bool {
+	if trimmed == "" {
+		return true
+	}
+	// Shebangs.
+	if lineIndex == 0 && strings.HasPrefix(trimmed, "#!") {
+		return true
+	}
+	// Common comment prefixes across many languages.
+	if strings.HasPrefix(trimmed, "//") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*/") || strings.HasPrefix(trimmed, "*") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "<!--") || strings.HasPrefix(trimmed, "-->") {
+		return true
+	}
+	// Treat '# ...' (hash followed by whitespace) as comment; avoid grabbing C preprocessor directives.
+	if strings.HasPrefix(trimmed, "#") {
+		if len(trimmed) >= 2 && (trimmed[1] == ' ' || trimmed[1] == '\t') {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+func extractLeadingHeaderBlock(s string, maxLines, maxBytes int) string {
+	if maxLines <= 0 || maxBytes <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	var out strings.Builder
+	linesUsed := 0
+	bytesUsed := 0
+	for i, line := range lines {
+		if linesUsed >= maxLines || bytesUsed >= maxBytes {
+			break
+		}
+		trimmed := strings.TrimSpace(line)
+		if !shouldCountHeaderLine(trimmed, i) {
+			break
+		}
+		// Add the line and newline (if not last) while respecting byte cap.
+		lineBytes := len(line)
+		if bytesUsed+lineBytes > maxBytes {
+			break
+		}
+		out.WriteString(line)
+		bytesUsed += lineBytes
+		linesUsed++
+		if i < len(lines)-1 {
+			if bytesUsed+1 > maxBytes {
+				break
+			}
+			out.WriteString("\n")
+			bytesUsed++
+		}
+	}
+	return out.String()
+}
+
+func addBlobCandidate(idx map[string]*BlobDef, content string) {
+	if len(content) == 0 {
+		return
+	}
+	h := calculateFileHash([]byte(content))
+	if existing, ok := idx[h]; ok {
+		existing.Count++
+	} else {
+		idx[h] = &BlobDef{ID: "", Hash: h, Content: content, Count: 1}
+	}
+}
+
+// buildLargeBlobIndex walks all files and collects repeated blobs across files (and within files).
+func buildLargeBlobIndex(entry *FileEntry, ctx *CompressionContext, idx map[string]*BlobDef) {
 	if entry == nil {
 		return
 	}
@@ -420,28 +774,33 @@ func buildLargeBlobIndex(entry *FileEntry, idx map[string]*BlobDef) {
 			return
 		}
 		content := string(entry.Content)
-		paragraphs := extractLargeParagraphs(content, largeBlobThresholdBytes)
+		if ctx != nil && ctx.Enabled {
+			transformed, _ := applyLossyTransforms(content, ctx, compressionTextFile, entry.Path)
+			content = transformed
+		}
+		paragraphs := extractLargeParagraphs(content, ctx.LargeBlobThresholdBytes)
 		for _, p := range paragraphs {
-			h := calculateFileHash([]byte(p))
-			if existing, ok := idx[h]; ok {
-				existing.Count++
-			} else {
-				idx[h] = &BlobDef{ID: "", Hash: h, Content: p, Count: 1}
+			addBlobCandidate(idx, p)
+		}
+		if ctx.HeaderBlobMinBytes > 0 {
+			header := extractLeadingHeaderBlock(content, ctx.HeaderBlobMaxLines, ctx.HeaderBlobMaxBytes)
+			if len(header) >= ctx.HeaderBlobMinBytes {
+				addBlobCandidate(idx, header)
 			}
 		}
 		return
 	}
 	for _, child := range entry.Children {
-		buildLargeBlobIndex(child, idx)
+		buildLargeBlobIndex(child, ctx, idx)
 	}
 }
 
 // finalizeBlobIDs filters blobs that meet the repetition threshold and assigns stable IDs
-func finalizeBlobIDs(idx map[string]*BlobDef) (map[string]*BlobDef, map[string]*BlobDef) {
+func finalizeBlobIDs(idx map[string]*BlobDef, minHits int, minBytes int) (map[string]*BlobDef, map[string]*BlobDef) {
 	blobsByID := make(map[string]*BlobDef)
 	blobsByHash := make(map[string]*BlobDef)
 	for hash, def := range idx {
-		if def.Count >= 2 && len(def.Content) >= largeBlobThresholdBytes {
+		if def.Count >= minHits && len(def.Content) >= minBytes {
 			id := "blob-" + hash[:8]
 			def.ID = id
 			blobsByID[id] = def
@@ -516,9 +875,12 @@ func replaceLargeBlobs(s string, ctx *CompressionContext) (string, bool) {
 
 // compressRepeatedBlocks detects consecutive repeated blocks of up to maxRepeatGroupLines lines
 // and collapses them to a single block plus an annotation line.
-func compressRepeatedBlocks(s string) (string, bool) {
+func compressRepeatedBlocks(s string, maxRepeatGroupLines int) (string, bool) {
 	lines := strings.Split(s, "\n")
 	if len(lines) == 0 {
+		return s, false
+	}
+	if maxRepeatGroupLines <= 0 {
 		return s, false
 	}
 	var out []string
@@ -567,6 +929,244 @@ func compressRepeatedBlocks(s string) (string, bool) {
 		}
 	}
 	return strings.Join(out, "\n"), changed
+}
+
+func maybeTruncateText(s string, ctx *CompressionContext) (string, bool) {
+	if ctx == nil || !ctx.Enabled {
+		return s, false
+	}
+	if ctx.TruncateMinLines <= 0 && ctx.TruncateMinBytes <= 0 {
+		return s, false
+	}
+
+	wantsByteTrunc := ctx.TruncateMinBytes > 0 && len(s) >= ctx.TruncateMinBytes
+
+	// Only count lines when needed.
+	lineCount := 1
+	if ctx.TruncateMinLines > 0 || !wantsByteTrunc {
+		lineCount = strings.Count(s, "\n") + 1
+	}
+	wantsLineTrunc := ctx.TruncateMinLines > 0 && lineCount >= ctx.TruncateMinLines
+
+	if !wantsLineTrunc && !wantsByteTrunc {
+		return s, false
+	}
+
+	// Prefer line-based truncation when it applies and would actually reduce output.
+	if wantsLineTrunc && ctx.TruncateHead > 0 && ctx.TruncateTail >= 0 {
+		lines := strings.Split(s, "\n")
+		if ctx.TruncateHead+ctx.TruncateTail+1 < len(lines) {
+			return truncateByLines(lines, ctx.TruncateHead, ctx.TruncateTail), true
+		}
+	}
+
+	if wantsByteTrunc && ctx.TruncateHeadBytes > 0 && ctx.TruncateTailBytes > 0 {
+		return truncateByBytes(s, ctx.TruncateHeadBytes, ctx.TruncateTailBytes)
+	}
+
+	return s, false
+}
+
+func truncateByLines(lines []string, head, tail int) string {
+	if head < 0 {
+		head = 0
+	}
+	if tail < 0 {
+		tail = 0
+	}
+	if head+tail+1 >= len(lines) {
+		return strings.Join(lines, "\n")
+	}
+	omitted := len(lines) - head - tail
+	out := make([]string, 0, head+tail+1)
+	if head > 0 {
+		out = append(out, lines[:head]...)
+	}
+	out = append(out, fmt.Sprintf("(...<<<omitted %d lines>>>...)", omitted))
+	if tail > 0 {
+		out = append(out, lines[len(lines)-tail:]...)
+	}
+	return strings.Join(out, "\n")
+}
+
+func truncateByBytes(s string, head, tail int) (string, bool) {
+	if head < 0 {
+		head = 0
+	}
+	if tail < 0 {
+		tail = 0
+	}
+	if head == 0 || tail == 0 {
+		return s, false
+	}
+	if head+tail+1 >= len(s) {
+		return s, false
+	}
+	omitted := len(s) - head - tail
+	truncated := s[:head] + fmt.Sprintf("\n(...<<<omitted %d bytes>>>...)\n", omitted) + s[len(s)-tail:]
+	return truncated, true
+}
+
+func isLikelyCodeFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".go", ".rs", ".py", ".rb", ".php", ".java", ".kt", ".kts", ".swift", ".c", ".cc", ".cpp", ".h", ".hh", ".hpp", ".cs", ".m", ".mm", ".js", ".jsx", ".ts", ".tsx":
+		return true
+	case ".sh", ".bash", ".zsh", ".ps1":
+		return true
+	}
+	return false
+}
+
+type outlineStyle struct {
+	Prefixes  []string
+	MaxIndent int // -1 means any
+}
+
+func outlineStyleForPath(path string) outlineStyle {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".go":
+		return outlineStyle{Prefixes: []string{"package ", "import ", "type ", "func ", "const ", "var "}, MaxIndent: 0}
+	case ".py":
+		return outlineStyle{Prefixes: []string{"def ", "class ", "async def "}, MaxIndent: 8}
+	case ".rs":
+		return outlineStyle{Prefixes: []string{"fn ", "pub ", "struct ", "enum ", "trait ", "impl ", "type ", "const ", "mod ", "use "}, MaxIndent: 0}
+	case ".js", ".jsx", ".ts", ".tsx":
+		return outlineStyle{Prefixes: []string{"export ", "function ", "class ", "interface ", "type ", "const ", "let ", "var ", "enum "}, MaxIndent: 0}
+	case ".java", ".kt", ".kts", ".cs", ".swift", ".c", ".cc", ".cpp", ".h", ".hh", ".hpp":
+		return outlineStyle{Prefixes: []string{"class ", "interface ", "enum ", "struct ", "func ", "def ", "public ", "private ", "protected ", "static "}, MaxIndent: 0}
+	case ".sh", ".bash", ".zsh":
+		return outlineStyle{Prefixes: []string{"function ", "export ", "readonly "}, MaxIndent: 0}
+	}
+	return outlineStyle{}
+}
+
+func ellipsize(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func extractOutlineLines(lines []string, path string, start, end, max int) []string {
+	if start < 0 {
+		start = 0
+	}
+	if end <= 0 || end > len(lines) {
+		end = len(lines)
+	}
+	if start >= end {
+		return nil
+	}
+
+	style := outlineStyleForPath(path)
+	if len(style.Prefixes) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, minNonZero(max, 64))
+	truncated := false
+
+	for i := start; i < end; i++ {
+		raw := lines[i]
+		if style.MaxIndent >= 0 {
+			indent := len(raw) - len(strings.TrimLeft(raw, " \t"))
+			if indent > style.MaxIndent {
+				continue
+			}
+		}
+
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		switch trimmed {
+		case "{", "}", "(", ")", "[", "]":
+			continue
+		}
+		match := false
+		for _, p := range style.Prefixes {
+			if strings.HasPrefix(trimmed, p) {
+				match = true
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+
+		out = append(out, fmt.Sprintf("L%d: %s", i+1, ellipsize(trimmed, 200)))
+		if max > 0 && len(out) >= max {
+			truncated = true
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	if truncated {
+		out = append(out, "(...<<<outline truncated>>>...)")
+	}
+	return out
+}
+
+func maybeTruncateTextWithOutline(s string, ctx *CompressionContext, kind compressionTextKind, pathHint string) (string, bool, bool) {
+	if ctx == nil || !ctx.Enabled {
+		return s, false, false
+	}
+	if ctx.TruncateMinLines <= 0 && ctx.TruncateMinBytes <= 0 {
+		return s, false, false
+	}
+
+	wantsByteTrunc := ctx.TruncateMinBytes > 0 && len(s) >= ctx.TruncateMinBytes
+
+	// Only count lines when needed.
+	lineCount := 1
+	if ctx.TruncateMinLines > 0 || !wantsByteTrunc {
+		lineCount = strings.Count(s, "\n") + 1
+	}
+	wantsLineTrunc := ctx.TruncateMinLines > 0 && lineCount >= ctx.TruncateMinLines
+
+	if !wantsLineTrunc && !wantsByteTrunc {
+		return s, false, false
+	}
+
+	if kind == compressionTextFile && ctx.Level >= 3 && strings.TrimSpace(pathHint) != "" && wantsLineTrunc {
+		lines := strings.Split(s, "\n")
+		if ctx.TruncateHead > 0 && ctx.TruncateTail >= 0 && ctx.TruncateHead+ctx.TruncateTail+1 < len(lines) {
+			head := ctx.TruncateHead
+			tail := ctx.TruncateTail
+			if isLikelyCodeFile(pathHint) {
+				// In code, tail is usually closing braces/noise; prefer an outline of omitted content.
+				tail = 0
+			}
+			start := head
+			end := len(lines) - tail
+			outline := extractOutlineLines(lines, pathHint, start, end, 200)
+			if isLikelyCodeFile(pathHint) && len(outline) > 0 {
+				out := make([]string, 0, head+len(outline)+8)
+				if head > 0 {
+					out = append(out, lines[:head]...)
+				}
+				omitted := len(lines) - head - tail
+				out = append(out, fmt.Sprintf("(...<<<omitted %d lines; outline below>>>...)", omitted))
+				out = append(out, "<<<outline>>>")
+				out = append(out, outline...)
+				out = append(out, "<<<end-outline>>>")
+				if tail > 0 {
+					out = append(out, lines[len(lines)-tail:]...)
+				}
+				return strings.Join(out, "\n"), true, true
+			}
+		}
+	}
+
+	truncated, changed := maybeTruncateText(s, ctx)
+	return truncated, changed, false
 }
 
 func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string, compCtx *CompressionContext, sections *[]OutputSection) {
@@ -625,13 +1225,33 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 		contentStr := string(entry.Content)
 		// Apply compression strategies when enabled
 		if compCtx != nil && compCtx.Enabled {
+			if transformed, changes := applyLossyTransforms(contentStr, compCtx, compressionTextFile, entry.Path); changes.Any {
+				contentStr = transformed
+				compCtx.Applied = true
+				if changes.Whitespace {
+					compCtx.AppliedWhitespace = true
+				}
+				if changes.Comments {
+					compCtx.AppliedComments = true
+				}
+			}
 			if replaced, changed := replaceLargeBlobs(contentStr, compCtx); changed {
 				contentStr = replaced
 				compCtx.Applied = true
+				compCtx.AppliedBlobs = true
 			}
-			if compressed, changed := compressRepeatedBlocks(contentStr); changed {
+			if compressed, changed := compressRepeatedBlocks(contentStr, compCtx.MaxRepeatGroupLines); changed {
 				contentStr = compressed
 				compCtx.Applied = true
+				compCtx.AppliedRepeats = true
+			}
+			if truncated, changed, outlined := maybeTruncateTextWithOutline(contentStr, compCtx, compressionTextFile, entry.Path); changed {
+				contentStr = truncated
+				compCtx.Applied = true
+				compCtx.AppliedTruncation = true
+				if outlined {
+					compCtx.AppliedOutline = true
+				}
 			}
 		}
 		if noFileDeduplication {
@@ -916,6 +1536,14 @@ subdirectories and their contents for each provided directory.`,
 			args = []string{"."}
 		}
 
+		effectiveCompressLevel := compressLevel
+		if !cmd.Flags().Changed("compress-level") && effectiveCompressLevel == 0 && compressOutput {
+			effectiveCompressLevel = 1
+		}
+		if effectiveCompressLevel < 0 || effectiveCompressLevel > 3 {
+			return fmt.Errorf("--compress-level must be between 0 and 3")
+		}
+
 		if tcountDetailed {
 			tcount = true
 		}
@@ -1057,30 +1685,28 @@ subdirectories and their contents for each provided directory.`,
 
 		// Prepare compression context when enabled
 		var compCtx *CompressionContext
-		if compressOutput {
+		if effectiveCompressLevel > 0 {
+			var err error
+			compCtx, err = newCompressionContext(effectiveCompressLevel)
+			if err != nil {
+				return err
+			}
 			// build global index for large repeated blobs across files and command outputs
 			tempIdx := make(map[string]*BlobDef)
-			buildLargeBlobIndex(root, tempIdx)
+			buildLargeBlobIndex(root, compCtx, tempIdx)
 			// include command outputs in the blob index
 			for _, r := range cmdResults {
-				for _, block := range extractLargeParagraphs(r.Stdout, largeBlobThresholdBytes) {
-					h := calculateFileHash([]byte(block))
-					if existing, ok := tempIdx[h]; ok {
-						existing.Count++
-					} else {
-						tempIdx[h] = &BlobDef{ID: "", Hash: h, Content: block, Count: 1}
-					}
+				stdoutStr, _ := applyLossyTransforms(r.Stdout, compCtx, compressionTextCommand, "")
+				for _, block := range extractLargeParagraphs(stdoutStr, compCtx.LargeBlobThresholdBytes) {
+					addBlobCandidate(tempIdx, block)
 				}
-				for _, block := range extractLargeParagraphs(r.Stderr, largeBlobThresholdBytes) {
-					h := calculateFileHash([]byte(block))
-					if existing, ok := tempIdx[h]; ok {
-						existing.Count++
-					} else {
-						tempIdx[h] = &BlobDef{ID: "", Hash: h, Content: block, Count: 1}
-					}
+				stderrStr, _ := applyLossyTransforms(r.Stderr, compCtx, compressionTextCommand, "")
+				for _, block := range extractLargeParagraphs(stderrStr, compCtx.LargeBlobThresholdBytes) {
+					addBlobCandidate(tempIdx, block)
 				}
 			}
-			blobsByID, blobsByHash := finalizeBlobIDs(tempIdx)
+			minBytes := minNonZero(compCtx.LargeBlobThresholdBytes, compCtx.HeaderBlobMinBytes)
+			blobsByID, blobsByHash := finalizeBlobIDs(tempIdx, compCtx.BlobMinHits, minBytes)
 			blobIDs := make([]string, 0, len(blobsByID))
 			for id := range blobsByID {
 				blobIDs = append(blobIDs, id)
@@ -1099,13 +1725,9 @@ subdirectories and their contents for each provided directory.`,
 				}
 				return li > lj
 			})
-			compCtx = &CompressionContext{
-				Enabled:     true,
-				BlobsByID:   blobsByID,
-				BlobsByHash: blobsByHash,
-				BlobIDs:     blobIDs,
-				UsedBlobIDs: make(map[string]bool),
-			}
+			compCtx.BlobsByID = blobsByID
+			compCtx.BlobsByHash = blobsByHash
+			compCtx.BlobIDs = blobIDs
 		}
 
 		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter, compCtx, sectionsPtr)
@@ -1129,13 +1751,30 @@ subdirectories and their contents for each provided directory.`,
 				if r.Stdout != "" {
 					stdoutStr := r.Stdout
 					if compCtx != nil && compCtx.Enabled {
+						if transformed, changes := applyLossyTransforms(stdoutStr, compCtx, compressionTextCommand, ""); changes.Any {
+							stdoutStr = transformed
+							compCtx.Applied = true
+							if changes.Whitespace {
+								compCtx.AppliedWhitespace = true
+							}
+						}
 						if replaced, changed := replaceLargeBlobs(stdoutStr, compCtx); changed {
 							stdoutStr = replaced
 							compCtx.Applied = true
+							compCtx.AppliedBlobs = true
 						}
-						if compressed, changed := compressRepeatedBlocks(stdoutStr); changed {
+						if compressed, changed := compressRepeatedBlocks(stdoutStr, compCtx.MaxRepeatGroupLines); changed {
 							stdoutStr = compressed
 							compCtx.Applied = true
+							compCtx.AppliedRepeats = true
+						}
+						if truncated, changed, outlined := maybeTruncateTextWithOutline(stdoutStr, compCtx, compressionTextCommand, ""); changed {
+							stdoutStr = truncated
+							compCtx.Applied = true
+							compCtx.AppliedTruncation = true
+							if outlined {
+								compCtx.AppliedOutline = true
+							}
 						}
 					}
 					output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, stdoutStr, delimiter))
@@ -1145,13 +1784,30 @@ subdirectories and their contents for each provided directory.`,
 				if r.Stderr != "" {
 					stderrStr := r.Stderr
 					if compCtx != nil && compCtx.Enabled {
+						if transformed, changes := applyLossyTransforms(stderrStr, compCtx, compressionTextCommand, ""); changes.Any {
+							stderrStr = transformed
+							compCtx.Applied = true
+							if changes.Whitespace {
+								compCtx.AppliedWhitespace = true
+							}
+						}
 						if replaced, changed := replaceLargeBlobs(stderrStr, compCtx); changed {
 							stderrStr = replaced
 							compCtx.Applied = true
+							compCtx.AppliedBlobs = true
 						}
-						if compressed, changed := compressRepeatedBlocks(stderrStr); changed {
+						if compressed, changed := compressRepeatedBlocks(stderrStr, compCtx.MaxRepeatGroupLines); changed {
 							stderrStr = compressed
 							compCtx.Applied = true
+							compCtx.AppliedRepeats = true
+						}
+						if truncated, changed, outlined := maybeTruncateTextWithOutline(stderrStr, compCtx, compressionTextCommand, ""); changed {
+							stderrStr = truncated
+							compCtx.Applied = true
+							compCtx.AppliedTruncation = true
+							if outlined {
+								compCtx.AppliedOutline = true
+							}
 						}
 					}
 					output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, stderrStr, delimiter))
@@ -1172,9 +1828,26 @@ subdirectories and their contents for each provided directory.`,
 		var blobSections []OutputSection
 		if compCtx != nil && compCtx.Applied {
 			var legend strings.Builder
-			legend.WriteString("Compression applied:\n")
-			legend.WriteString("- Repeated lines/groups shown once + (...<<<repeats N times>>>...)\n")
-			legend.WriteString("- Large repeated blobs replaced with <<<blob-id>>> and listed at end\n\n")
+			features := make([]string, 0, 6)
+			if compCtx.AppliedWhitespace {
+				features = append(features, "blank-lines")
+			}
+			if compCtx.AppliedComments {
+				features = append(features, "comments")
+			}
+			if compCtx.AppliedRepeats {
+				features = append(features, "repeats")
+			}
+			if compCtx.AppliedBlobs {
+				features = append(features, "blobs")
+			}
+			if compCtx.AppliedTruncation {
+				features = append(features, "truncation")
+			}
+			if compCtx.AppliedOutline {
+				features = append(features, "outline")
+			}
+			legend.WriteString(fmt.Sprintf("Compression: level %d (%s)\n\n", compCtx.Level, strings.Join(features, ", ")))
 			legendStr = legend.String()
 
 			// Append blobs section only for used IDs
@@ -1209,7 +1882,17 @@ subdirectories and their contents for each provided directory.`,
 					blobStart := blobsSection.Len()
 					blobsSection.WriteString(fmt.Sprintf("\n- id: %s\n", id))
 					blobsSection.WriteString("- content:\n")
-					blobsSection.WriteString(fmt.Sprintf("%s\n%s\n%s\n", delimiter, def.Content, delimiter))
+					blobContent := def.Content
+					if compCtx.Level >= 3 {
+						if truncated, changed, outlined := maybeTruncateTextWithOutline(blobContent, compCtx, compressionTextFile, ""); changed {
+							blobContent = truncated
+							compCtx.AppliedTruncation = true
+							if outlined {
+								compCtx.AppliedOutline = true
+							}
+						}
+					}
+					blobsSection.WriteString(fmt.Sprintf("%s\n%s\n%s\n", delimiter, blobContent, delimiter))
 					if sectionsPtr != nil {
 						blobSections = append(blobSections, OutputSection{Label: "[blob] " + id, Start: blobStart, End: blobsSection.Len()})
 					}
@@ -1524,6 +2207,7 @@ func init() {
 
 	// Output compression flag (disabled by default)
 	rootCmd.Flags().BoolVar(&compressOutput, "compress", false, "Compress output by collapsing repeats and extracting large repeated blobs")
+	rootCmd.Flags().IntVar(&compressLevel, "compress-level", 0, "Compression level (0=off, 1=default, 2=more, 3=most aggressive)")
 
 	// Allow specifying any number of commands. Each --command is executed after flattening.
 	rootCmd.Flags().StringArrayVar(&commands, "command", []string{}, "Command to run after flattening (can be repeated)")
