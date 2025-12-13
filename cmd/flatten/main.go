@@ -265,7 +265,8 @@ func loadDirectoryDryRun(path string, filter *Filter) (*FileEntry, error) {
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %w", path, err)
+		entry.ReadError = err.Error()
+		return entry, nil
 	}
 	for _, item := range entries {
 		childPath := filepath.Join(path, item.Name())

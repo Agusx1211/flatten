@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
@@ -134,6 +136,9 @@ func (f *Filter) WithGitIgnoreFile(dir string) (*Filter, error) {
 		if os.IsNotExist(err) {
 			return f, nil
 		}
+		if errors.Is(err, fs.ErrPermission) {
+			return f, nil
+		}
 		return nil, fmt.Errorf("failed to stat %s: %w", gitIgnorePath, err)
 	}
 	if info.IsDir() {
@@ -142,6 +147,9 @@ func (f *Filter) WithGitIgnoreFile(dir string) (*Filter, error) {
 
 	content, err := os.ReadFile(gitIgnorePath)
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return f, nil
+		}
 		return nil, fmt.Errorf("failed to read %s: %w", gitIgnorePath, err)
 	}
 
@@ -239,6 +247,9 @@ func (f *Filter) WithFlattenFile(dir string) (*Filter, error) {
 		if os.IsNotExist(err) {
 			return f, nil
 		}
+		if errors.Is(err, fs.ErrPermission) {
+			return f, nil
+		}
 		return nil, fmt.Errorf("failed to stat %s: %w", flattenPath, err)
 	}
 	if info.IsDir() {
@@ -247,6 +258,9 @@ func (f *Filter) WithFlattenFile(dir string) (*Filter, error) {
 
 	rules, err := readFlattenFile(flattenPath, f.profile)
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return f, nil
+		}
 		return nil, fmt.Errorf("failed to parse %s: %w", flattenPath, err)
 	}
 
