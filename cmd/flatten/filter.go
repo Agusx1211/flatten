@@ -68,6 +68,11 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 	relPath := f.relativePath(path)
 	isDir := info.IsDir()
 	isSymlink := info.Mode()&os.ModeSymlink != 0
+	hasIncludes := len(f.includePatterns) > 0
+	matchesInclude := !hasIncludes
+	if !isDir && hasIncludes {
+		matchesInclude = f.matchesPatterns(relPath, false, f.includePatterns)
+	}
 
 	if f.matchesPatterns(relPath, isDir, f.excludePatterns) {
 		return false
@@ -83,7 +88,7 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 
 	if !f.includeLocks && !info.IsDir() {
 		base := filepath.Base(path)
-		if isLockFile(base) {
+		if isLockFile(base) && !(hasIncludes && matchesInclude) {
 			return false
 		}
 	}
@@ -95,8 +100,8 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		}
 	}
 
-	if !isDir && len(f.includePatterns) > 0 {
-		if !f.matchesPatterns(relPath, false, f.includePatterns) {
+	if !isDir && hasIncludes {
+		if !matchesInclude {
 			return false
 		}
 	}

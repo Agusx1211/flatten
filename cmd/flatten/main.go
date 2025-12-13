@@ -1388,7 +1388,7 @@ func init() {
 	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "E", []string{}, "Exclude files matching these patterns (e.g. '*.test.js')")
 	rootCmd.Flags().StringVarP(&profileName, "profile", "p", "default", "Profile to use when reading .flatten files")
 
-	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, ```, ~~~, `````, ~~~~~, ~~~~~~~~~~~)")
+	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, <3 backticks>, ~~~, <5 backticks>, ~~~~~, ~~~~~~~~~~~)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "List all files that would be included without processing content")
 
 	// Output compression flag (disabled by default)

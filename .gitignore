@@ -74,3 +74,6 @@ out/
 
 # Output file from flatten tool
 flat
+
+# Local issue tracker (do not commit)
+ISSUES.md
