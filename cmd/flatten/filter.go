@@ -16,6 +16,7 @@ import (
 // Filter handles file filtering logic
 type Filter struct {
 	gitIgnore          *ignore.GitIgnore
+	gitIgnoreLines     []string
 	includeAll         bool
 	includeGit         bool
 	includeBin         bool
@@ -57,17 +58,6 @@ func NewFilter(
 		excludePatterns:    compiledExcludes,
 		profile:            profile,
 		hasDirOnlyIncludes: hasDirOnlyPattern(compiledIncludes),
-	}
-
-	if !includeGitIgnore {
-		gitIgnorePath := filepath.Join(dir, ".gitignore")
-		if _, err := os.Stat(gitIgnorePath); err == nil {
-			gitIgnore, err := ignore.CompileIgnoreFile(gitIgnorePath)
-			if err != nil {
-				return nil, err
-			}
-			f.gitIgnore = gitIgnore
-		}
 	}
 
 	return f, nil
@@ -129,6 +119,115 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 	}
 
 	return !f.gitIgnore.MatchesPath(relPath)
+}
+
+// WithGitIgnoreFile returns a new Filter that includes rules from a .gitignore file found in dir.
+// If no .gitignore file is present, the current filter is returned unchanged.
+func (f *Filter) WithGitIgnoreFile(dir string) (*Filter, error) {
+	if f.includeAll {
+		return f, nil
+	}
+
+	gitIgnorePath := filepath.Join(dir, ".gitignore")
+	info, err := os.Stat(gitIgnorePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return f, nil
+		}
+		return nil, fmt.Errorf("failed to stat %s: %w", gitIgnorePath, err)
+	}
+	if info.IsDir() {
+		return f, nil
+	}
+
+	content, err := os.ReadFile(gitIgnorePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", gitIgnorePath, err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	relDir := f.relativePath(dir)
+	prefixed := prefixGitIgnoreLines(lines, relDir)
+
+	newLines := append([]string{}, f.gitIgnoreLines...)
+	newLines = append(newLines, prefixed...)
+
+	gi := ignore.CompileIgnoreLines(newLines...)
+
+	nf := *f
+	nf.gitIgnoreLines = newLines
+	nf.gitIgnore = gi
+	return &nf, nil
+}
+
+func prefixGitIgnoreLines(lines []string, relDir string) []string {
+	if relDir == "" || relDir == "." {
+		return lines
+	}
+
+	relDir = strings.TrimPrefix(relDir, "./")
+	relDir = strings.TrimPrefix(relDir, "/")
+	relDir = strings.TrimSuffix(relDir, "/")
+	if relDir == "" || relDir == "." {
+		return lines
+	}
+
+	prefix := path.Clean(relDir)
+	if prefix == "." || prefix == "/" {
+		return lines
+	}
+
+	out := make([]string, 0, len(lines))
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			out = append(out, raw)
+			continue
+		}
+
+		negated := strings.HasPrefix(trimmed, "!")
+		pat := trimmed
+		if negated {
+			pat = strings.TrimPrefix(pat, "!")
+		}
+
+		anchored := strings.HasPrefix(pat, "/")
+		pat = strings.TrimPrefix(pat, "/")
+
+		dirOnly := strings.HasSuffix(pat, "/")
+		patTrim := strings.TrimSuffix(pat, "/")
+		patTrim = strings.TrimPrefix(patTrim, "./")
+		patTrim = strings.TrimPrefix(patTrim, "/")
+
+		hasSlashInBody := strings.Contains(patTrim, "/")
+
+		var joined string
+		switch {
+		case anchored:
+			// anchored to the directory that owns the .gitignore
+			joined = path.Join(prefix, patTrim)
+		case hasSlashInBody:
+			// relative to the directory that owns the .gitignore
+			joined = path.Join(prefix, patTrim)
+		default:
+			// no "/" patterns match at any depth under the .gitignore directory
+			joined = path.Join(prefix, "**", patTrim)
+		}
+
+		if dirOnly {
+			joined += "/"
+		}
+
+		// Use a leading slash to scope nested rules to this subtree.
+		prefixedLine := "/" + joined
+		if negated {
+			prefixedLine = "!" + prefixedLine
+		}
+
+		out = append(out, prefixedLine)
+	}
+
+	return out
 }
 
 // WithFlattenFile returns a new Filter that includes the rules defined in a .flatten file found in dir.

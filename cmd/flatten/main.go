@@ -175,6 +175,10 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 		if err != nil {
 			return nil, err
 		}
+		updatedFilter, err = updatedFilter.WithGitIgnoreFile(path)
+		if err != nil {
+			return nil, err
+		}
 		childFilter = updatedFilter
 	}
 	entries, err := os.ReadDir(path)
@@ -218,6 +222,10 @@ func loadDirectoryDryRun(path string, filter *Filter) (*FileEntry, error) {
 	childFilter := filter
 	if info.IsDir() {
 		updatedFilter, err := filter.WithFlattenFile(path)
+		if err != nil {
+			return nil, err
+		}
+		updatedFilter, err = updatedFilter.WithGitIgnoreFile(path)
 		if err != nil {
 			return nil, err
 		}
