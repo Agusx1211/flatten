@@ -370,6 +370,7 @@ type CompressionContext struct {
 	Enabled     bool
 	BlobsByID   map[string]*BlobDef
 	BlobsByHash map[string]*BlobDef
+	BlobIDs     []string
 	UsedBlobIDs map[string]bool
 	Applied     bool
 }
@@ -458,7 +459,19 @@ func replaceLargeBlobs(s string, ctx *CompressionContext) (string, bool) {
 	}
 	changed := false
 	result := s
-	for id, blob := range ctx.BlobsByID {
+	ids := ctx.BlobIDs
+	if len(ids) == 0 {
+		ids = make([]string, 0, len(ctx.BlobsByID))
+		for id := range ctx.BlobsByID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+	}
+	for _, id := range ids {
+		blob := ctx.BlobsByID[id]
+		if blob == nil {
+			continue
+		}
 		placeholder := "<<<" + id + ">>>"
 		if strings.Contains(result, blob.Content) {
 			result = strings.ReplaceAll(result, blob.Content, placeholder)
@@ -1010,10 +1023,29 @@ subdirectories and their contents for each provided directory.`,
 				}
 			}
 			blobsByID, blobsByHash := finalizeBlobIDs(tempIdx)
+			blobIDs := make([]string, 0, len(blobsByID))
+			for id := range blobsByID {
+				blobIDs = append(blobIDs, id)
+			}
+			sort.Slice(blobIDs, func(i, j int) bool {
+				li := 0
+				lj := 0
+				if def := blobsByID[blobIDs[i]]; def != nil {
+					li = len(def.Content)
+				}
+				if def := blobsByID[blobIDs[j]]; def != nil {
+					lj = len(def.Content)
+				}
+				if li == lj {
+					return blobIDs[i] < blobIDs[j]
+				}
+				return li > lj
+			})
 			compCtx = &CompressionContext{
 				Enabled:     true,
 				BlobsByID:   blobsByID,
 				BlobsByHash: blobsByHash,
+				BlobIDs:     blobIDs,
 				UsedBlobIDs: make(map[string]bool),
 			}
 		}
@@ -1095,7 +1127,25 @@ subdirectories and their contents for each provided directory.`,
 				blobSections = append(blobSections, OutputSection{Label: "[blobs]", Start: blobHeaderStart, End: blobsSection.Len()})
 			}
 			anyBlob := false
+			usedIDs := make([]string, 0, len(compCtx.UsedBlobIDs))
 			for id := range compCtx.UsedBlobIDs {
+				usedIDs = append(usedIDs, id)
+			}
+			sort.Slice(usedIDs, func(i, j int) bool {
+				li := 0
+				lj := 0
+				if def := compCtx.BlobsByID[usedIDs[i]]; def != nil {
+					li = len(def.Content)
+				}
+				if def := compCtx.BlobsByID[usedIDs[j]]; def != nil {
+					lj = len(def.Content)
+				}
+				if li == lj {
+					return usedIDs[i] < usedIDs[j]
+				}
+				return li > lj
+			})
+			for _, id := range usedIDs {
 				if def, ok := compCtx.BlobsByID[id]; ok {
 					anyBlob = true
 					blobStart := blobsSection.Len()
