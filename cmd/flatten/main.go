@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +68,8 @@ var (
 	showChecksum    bool
 	showAllMetadata bool
 	showTotalSize   bool
+
+	showLineNumbers bool
 
 	showTokens  bool
 	tokensModel string
@@ -1169,6 +1172,31 @@ func maybeTruncateTextWithOutline(s string, ctx *CompressionContext, kind compre
 	return truncated, changed, false
 }
 
+func addLineNumbers(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	lines := strings.Split(s, "\n")
+	if strings.HasSuffix(s, "\n") && len(lines) > 0 {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+
+	width := len(strconv.Itoa(len(lines)))
+	var b strings.Builder
+	b.Grow(len(s) + len(lines)*(width+3))
+	for i, line := range lines {
+		fmt.Fprintf(&b, "%*d | %s", width, i+1, line)
+		if i < len(lines)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
 func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string, compCtx *CompressionContext, sections *[]OutputSection) {
 	if !entry.IsDir {
 		start := 0
@@ -1206,7 +1234,11 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			if showTokens {
 				w.WriteString(fmt.Sprintf("- tokens: %d\n", entry.Tokens))
 			}
-			w.WriteString(fmt.Sprintf("- content:\n%s\n(unreadable: %s)\n%s\n", delimiter, entry.ReadError, delimiter))
+			contentStr := fmt.Sprintf("(unreadable: %s)", entry.ReadError)
+			if showLineNumbers {
+				contentStr = addLineNumbers(contentStr)
+			}
+			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
 			if sections != nil {
 				*sections = append(*sections, OutputSection{Label: entry.Path, Start: start, End: w.Len()})
 			}
@@ -1253,6 +1285,9 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 					compCtx.AppliedOutline = true
 				}
 			}
+		}
+		if showLineNumbers {
+			contentStr = addLineNumbers(contentStr)
 		}
 		if noFileDeduplication {
 			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
@@ -1777,6 +1812,9 @@ subdirectories and their contents for each provided directory.`,
 							}
 						}
 					}
+					if showLineNumbers {
+						stdoutStr = addLineNumbers(stdoutStr)
+					}
 					output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, stdoutStr, delimiter))
 				} else {
 					output.WriteString("- stdout: (empty)\n")
@@ -1809,6 +1847,9 @@ subdirectories and their contents for each provided directory.`,
 								compCtx.AppliedOutline = true
 							}
 						}
+					}
+					if showLineNumbers {
+						stderrStr = addLineNumbers(stderrStr)
 					}
 					output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, stderrStr, delimiter))
 				} else {
@@ -2190,6 +2231,8 @@ func init() {
 	rootCmd.Flags().BoolVarP(&showChecksum, "show-checksum", "c", false, "Show SHA256 checksum of files")
 	rootCmd.Flags().BoolVarP(&showAllMetadata, "all-metadata", "a", false, "Show all metadata")
 	rootCmd.Flags().BoolVarP(&showTotalSize, "show-total-size", "Z", false, "Show total size of all files")
+
+	rootCmd.Flags().BoolVar(&showLineNumbers, "line-numbers", false, "Include line numbers in file and command output content")
 
 	rootCmd.Flags().BoolVarP(&showTokens, "tokens", "t", false, "Show token usage for each file/directory")
 	rootCmd.Flags().StringVar(&tokensModel, "tokens-model", "gpt-4o-mini", "Model to use for --tokens (per-file token counting)")

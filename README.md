@@ -100,32 +100,41 @@ Below is the help output for quick reference:
 
 ```
 Usage:
-  flatten [directory] [flags]
+  flatten [directories]... [flags]
 
 Flags:
-  -a, --all-metadata        Show all available metadata
-      --include-bin         Include binary files in the output
-  -g, --include-git         Include .git directory and its contents
-  -i, --include-gitignore   Include files that would normally be ignored by .gitignore
-      --include-locks       Include lock files (package-lock.json, yarn.lock, etc.)
-	  -l, --last-updated        Show last updated time for each file
-	      --no-dedup            Disable file deduplication
-	      --prefix              Optional message printed before output
-	      --suffix              Optional message printed after output
-	  -c, --show-checksum       Show SHA256 checksum of files
-	  -M, --show-mime           Show file MIME types
-	  -m, --show-mode           Show file permissions
-	  -o, --show-owner          Show file owner and group
-  -z, --show-size           Show individual file sizes
-  -Z, --show-total-size     Show total size of all files
-      --compress            Compress output by collapsing repeats and extracting large repeated blobs
-      --compress-level int  Compression level (0=off, 1=default, 2=more, 3=most aggressive)
-  -t, --tokens              Show token usage for each file/directory
-      --tokens-model        Model to use for token counting
-  -y, --show-symlinks       Show symlink targets
-  -h, --help                Help for flatten
-  -I, --include             Include only files matching these patterns (e.g. '*.go,*.js')
-  -E, --exclude             Exclude files matching these patterns (e.g. '*.test.js')
+  -a, --all-metadata                Show all metadata
+      --command stringArray         Command to run after flattening (can be repeated)
+      --compress                    Compress output by collapsing repeats and extracting large repeated blobs
+      --compress-level int          Compression level (0=off, 1=default, 2=more, 3=most aggressive)
+  -d, --dry-run                     List all files that would be included without processing content
+  -E, --exclude strings             Exclude files matching these patterns (e.g. '*.test.js')
+  -h, --help                        help for flatten
+  -I, --include strings             Include only files matching these patterns (e.g. '*.go,*.js')
+      --include-bin                 Include binary files in the output
+  -g, --include-git                 Include .git directory
+  -i, --include-gitignore           Include files normally ignored by .gitignore
+      --include-locks               Include lock files (package-lock.json, yarn.lock, etc.)
+  -l, --last-updated                Show last updated time for each file
+      --line-numbers                Include line numbers in file and command output content
+      --markdown-delimiter string   Markdown code block delimiter (auto, <3 backticks>, ~~~, <5 backticks>, ~~~~~, ~~~~~~~~~~~) (default "auto")
+      --no-dedup                    Disable file deduplication
+      --prefix string               Optional message printed before output, wrapped by --- lines
+  -p, --profile string              Profile to use when reading .flatten files (default "default")
+  -c, --show-checksum               Show SHA256 checksum of files
+  -M, --show-mime                   Show file MIME types
+  -m, --show-mode                   Show file permissions
+  -o, --show-owner                  Show file owner and group
+  -z, --show-size                   Show individual file sizes
+  -y, --show-symlinks               Show symlink targets
+  -Z, --show-total-size             Show total size of all files
+      --suffix string               Optional message printed after output, wrapped by --- lines
+      --tcount                      Print token count of the full output (equivalent to: flatten | tcount)
+      --tcount-detailed             Print token count and a breakdown of token usage by path/section
+      --tcount-model string         Model to use for token-counting the full output (defaults to --tokens-model)
+  -t, --tokens                      Show token usage for each file/directory
+      --tokens-model string         Model to use for --tokens (per-file token counting) (default "gpt-4o-mini")
+  -v, --version                     version for flatten
 ```
 
 Note: `--include` (and any `include` rules from `.flatten`) still respect `.gitignore` by default. To include files that are ignored by `.gitignore` (like `go.sum` in this repo), pass `--include-gitignore`.
