@@ -306,20 +306,27 @@ func getTotalSize(entry *FileEntry) int64 {
 	return total
 }
 
-func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool) string {
+func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool, isRoot bool, showFullPath bool) string {
 	var sb strings.Builder
-	if entry.Path != "." {
+	if isRoot {
+		name := entry.Path
+		if name == "" {
+			name = "."
+		}
+		if entry.ReadError != "" {
+			name = fmt.Sprintf("%s (unreadable)", name)
+		}
+		if showTokens {
+			name = fmt.Sprintf("%s (%d tokens)", name, entry.Tokens)
+		}
+		sb.WriteString(name + "\n")
+	} else {
 		marker := "├── "
 		if isLast {
 			marker = "└── "
 		}
-		// For the root's direct children (top-level dirs), show full path
-		// For everything else, show just the base name
 		name := entry.Path
-		if !strings.HasPrefix(prefix, "│") && !strings.HasPrefix(prefix, " ") {
-			// This is a top-level directory, keep full path
-		} else {
-			// This is a child, show only base name
+		if !showFullPath {
 			name = filepath.Base(entry.Path)
 		}
 		if entry.ReadError != "" {
@@ -332,7 +339,7 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool
 	}
 	if entry.IsDir {
 		newPrefix := prefix
-		if entry.Path != "." {
+		if !isRoot {
 			if isLast {
 				newPrefix += "    "
 			} else {
@@ -341,10 +348,33 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool
 		}
 		for i, child := range entry.Children {
 			isLastChild := i == len(entry.Children)-1
-			sb.WriteString(renderDirTree(child, newPrefix, isLastChild, showTokens))
+			sb.WriteString(renderDirTree(child, newPrefix, isLastChild, showTokens, false, false))
 		}
 	}
 	return sb.String()
+}
+
+func renderDirTreeForOutput(root *FileEntry, showTokens bool) string {
+	if root == nil {
+		return ""
+	}
+
+	// If we only have a single top-level directory, treat that directory as the tree root.
+	if root.IsDir && root.Path == "." && len(root.Children) == 1 && root.Children[0] != nil && root.Children[0].IsDir {
+		return renderDirTree(root.Children[0], "", true, showTokens, true, false)
+	}
+
+	// Multi-root output: print each top-level entry with its full path.
+	if root.IsDir && root.Path == "." {
+		var sb strings.Builder
+		for i, child := range root.Children {
+			isLastChild := i == len(root.Children)-1
+			sb.WriteString(renderDirTree(child, "", isLastChild, showTokens, false, true))
+		}
+		return sb.String()
+	}
+
+	return renderDirTree(root, "", true, showTokens, true, false)
 }
 
 func calculateFileHash(content []byte) string {
@@ -961,7 +991,7 @@ subdirectories and their contents for each provided directory.`,
 			if showTotalSize {
 				output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
 			}
-			output.WriteString(fmt.Sprintf("\nDirectory structure:\n%s\n", renderDirTree(root, "", false, false)))
+			output.WriteString(fmt.Sprintf("\nDirectory structure:\n%s\n", renderDirTreeForOutput(root, false)))
 			output.WriteString("Files:\n")
 			printDryRunOutput(root, &output)
 			printFinalOutput(output.String(), prefixMessage, suffixMessage)
@@ -978,7 +1008,7 @@ subdirectories and their contents for each provided directory.`,
 		if showTotalSize {
 			output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
 		}
-		output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTree(root, "", false, showTokens)))
+		output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTreeForOutput(root, showTokens)))
 		if sectionsPtr != nil {
 			*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[header]", Start: headerStart, End: output.Len()})
 		}
