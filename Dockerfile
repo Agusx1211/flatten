@@ -29,18 +29,19 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /root/
 
-# Copy the binary from builder
-COPY --from=builder /app/flatten .
-
-# Make it executable
-RUN chmod +x ./flatten
-
 # Create a non-root user
 RUN adduser -D -s /bin/sh flattenuser
+
+# Create a writable workdir for the non-root user
+RUN mkdir -p /workspace && chown -R flattenuser:flattenuser /workspace
+
+# Copy the binary from builder into a location accessible to the non-root user
+COPY --from=builder /app/flatten /usr/local/bin/flatten
+RUN chmod +x /usr/local/bin/flatten
 USER flattenuser
 
 WORKDIR /workspace
 
 # Set the binary as entrypoint
-ENTRYPOINT ["/root/flatten"]
+ENTRYPOINT ["/usr/local/bin/flatten"]
 CMD ["--help"]
