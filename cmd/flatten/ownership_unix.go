@@ -12,7 +12,7 @@ import (
 
 // getOwnershipInfo returns ownership information for Unix-like systems
 func getOwnershipInfo(path string, w *strings.Builder) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return
 	}

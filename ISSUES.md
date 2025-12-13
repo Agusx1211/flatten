@@ -5,44 +5,6 @@ Collected on Linux (arm64) with Go `go1.25.5` by:
 - Running `go test ./...` and `go vet ./...`
 - Manually exercising flags via the built `./bin/flatten`
 
-## 1) `--show-symlinks` doesn’t show symlink targets
-
-**Symptoms**
-- `--show-symlinks` produces no `- symlink-target:` lines.
-- `--all-metadata` *does* show `- symlink-target:` for symlinks, which makes `--show-symlinks` look broken.
-
-**Repro**
-1. Create a directory containing a symlink.
-2. Run:
-   - `flatten <dir> --show-symlinks --no-dedup`
-   - Compare with: `flatten <dir> --all-metadata --no-dedup`
-
-**Likely cause**
-- Directory walking uses `os.Stat` (follows symlinks), so `entry.Mode` typically won’t include `os.ModeSymlink`.
-- The `--show-symlinks` conditional checks `entry.Mode&os.ModeSymlink != 0`, which is rarely true under `os.Stat`.
-
-**Refs**
-- `cmd/flatten/main.go:145` (uses `os.Stat`)
-- `cmd/flatten/main.go:501` (checks `os.ModeSymlink`)
-
-## 2) Symlink directories are followed (loops and out-of-tree traversal)
-
-**Symptoms**
-- A symlink loop can make `flatten` error with “too many levels of symbolic links”.
-- A symlink pointing outside the input directory can cause `flatten` to traverse and dump files outside the intended root.
-
-**Repro (loop)**
-1. Make a directory with `loop -> .` inside it.
-2. Run: `flatten <dir> --dry-run`
-3. Observed: failure while trying to stat `.../loop/loop/loop/...` until the OS errors.
-
-**Likely cause**
-- `os.Stat`/`os.ReadDir` follow symlinks and there’s no cycle detection / visited-set.
-
-**Refs**
-- `cmd/flatten/main.go:145` / `cmd/flatten/main.go:198` (uses `os.Stat`)
-- `cmd/flatten/main.go:180` / `cmd/flatten/main.go:246` (reads directories recursively)
-
 ## 3) Directory-only `--include` patterns can exclude everything (root is not includable)
 
 **Symptoms**

@@ -67,6 +67,7 @@ func NewFilter(
 func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 	relPath := f.relativePath(path)
 	isDir := info.IsDir()
+	isSymlink := info.Mode()&os.ModeSymlink != 0
 
 	if f.matchesPatterns(relPath, isDir, f.excludePatterns) {
 		return false
@@ -87,7 +88,7 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		}
 	}
 
-	if !f.includeBin && !info.IsDir() {
+	if !f.includeBin && !info.IsDir() && !isSymlink {
 		isBinary, err := f.isBinaryFile(path)
 		if err == nil && isBinary {
 			return false

@@ -142,13 +142,14 @@ func sumTokens(entry *FileEntry) int {
 }
 
 func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*FileEntry, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat path %s: %w", path, err)
 	}
 	if !filter.ShouldInclude(info, path) {
 		return nil, nil
 	}
+	isSymlink := info.Mode()&os.ModeSymlink != 0
 	entry := &FileEntry{
 		Path:     path,
 		IsDir:    info.IsDir(),
@@ -156,6 +157,18 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 		Mode:     info.Mode(),
 		ModTime:  info.ModTime().Unix(),
 		Children: make([]*FileEntry, 0),
+	}
+	if isSymlink {
+		entry.Content = []byte{}
+		target, err := os.Readlink(path)
+		if err == nil {
+			entry.Content = []byte(target)
+			if tokenizer != nil {
+				toks := tokenizer.Encode(target, nil, nil)
+				entry.Tokens = len(toks)
+			}
+		}
+		return entry, nil
 	}
 	if !info.IsDir() {
 		content, err := os.ReadFile(path)
@@ -199,7 +212,7 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 }
 
 func loadDirectoryDryRun(path string, filter *Filter) (*FileEntry, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat path %s: %w", path, err)
 	}
