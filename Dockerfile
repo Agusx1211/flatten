@@ -1,8 +1,7 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 
-# Install git for version information
-RUN apk add --no-cache git
+ARG VERSION=docker
 
 WORKDIR /app
 
@@ -17,7 +16,7 @@ COPY . .
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo 'docker')" \
+    -ldflags="-s -w -X main.version=${VERSION}" \
     -o flatten \
     ./cmd/flatten
 
