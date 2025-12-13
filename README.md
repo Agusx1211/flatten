@@ -126,6 +126,8 @@ Flags:
   -E, --exclude             Exclude files matching these patterns (e.g. '*.test.js')
 ```
 
+Note: `--include` (and any `include` rules from `.flatten`) still respect `.gitignore` by default. To include files that are ignored by `.gitignore` (like `go.sum` in this repo), pass `--include-gitignore`.
+
 ### Running Commands After Flattening
 - `--command`: Command to run after flattening (can be repeated). Each command runs in the current working directory, and its start/end time, duration, exit code, stdout, and stderr are appended to the end of the flatten output.
 
