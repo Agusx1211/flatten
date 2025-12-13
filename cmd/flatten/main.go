@@ -696,6 +696,75 @@ func tokenCountsBySection(tkm *tiktoken.Tiktoken, tokens []int, sections []Outpu
 	return len(tokens), counts
 }
 
+func collectNodePaths(entry *FileEntry, filePaths map[string]bool, dirPaths map[string]bool) {
+	if entry == nil {
+		return
+	}
+	if entry.IsDir {
+		if dirPaths != nil {
+			dirPaths[entry.Path] = true
+		}
+		for _, child := range entry.Children {
+			collectNodePaths(child, filePaths, dirPaths)
+		}
+		return
+	}
+	if filePaths != nil {
+		filePaths[entry.Path] = true
+	}
+}
+
+func computeSubtreeTokenStats(entry *FileEntry, sectionTokens map[string]int, subtreeTokens map[string]int, subtreeFiles map[string]int) (int, int) {
+	if entry == nil {
+		return 0, 0
+	}
+	totalTokens := 0
+	if sectionTokens != nil {
+		totalTokens = sectionTokens[entry.Path]
+	}
+	if !entry.IsDir {
+		if subtreeTokens != nil {
+			subtreeTokens[entry.Path] = totalTokens
+		}
+		if subtreeFiles != nil {
+			subtreeFiles[entry.Path] = 1
+		}
+		return totalTokens, 1
+	}
+
+	totalFiles := 0
+	for _, child := range entry.Children {
+		ct, cf := computeSubtreeTokenStats(child, sectionTokens, subtreeTokens, subtreeFiles)
+		totalTokens += ct
+		totalFiles += cf
+	}
+	if subtreeTokens != nil {
+		subtreeTokens[entry.Path] = totalTokens
+	}
+	if subtreeFiles != nil {
+		subtreeFiles[entry.Path] = totalFiles
+	}
+	return totalTokens, totalFiles
+}
+
+func formatDirPathForReport(path string) string {
+	if path == "." || path == string(os.PathSeparator) {
+		return path
+	}
+	sep := string(os.PathSeparator)
+	if strings.HasSuffix(path, sep) {
+		return path
+	}
+	return path + sep
+}
+
+func formatPercent(n int, total int) string {
+	if total <= 0 {
+		return "0.0%"
+	}
+	return fmt.Sprintf("%.1f%%", (float64(n)/float64(total))*100.0)
+}
+
 // printFinalOutput prints optional prefix, then wraps only the main content
 // with --- lines, and finally prints optional suffix. If either prefix or
 // suffix is provided, the content is surrounded by --- lines. The prefix has
@@ -1056,39 +1125,187 @@ subdirectories and their contents for each provided directory.`,
 			finalSections = fillSectionGaps(finalSections, len(printed))
 			totalTokens, countsByLabel := tokenCountsBySection(tkm, tokens, finalSections)
 
-			type labeledCount struct {
-				Label  string
-				Tokens int
-			}
-			counts := make([]labeledCount, 0, len(countsByLabel))
-			for label, n := range countsByLabel {
-				counts = append(counts, labeledCount{Label: label, Tokens: n})
-			}
-			sort.Slice(counts, func(i, j int) bool {
-				if counts[i].Tokens == counts[j].Tokens {
-					return counts[i].Label < counts[j].Label
-				}
-				return counts[i].Tokens > counts[j].Tokens
-			})
+			filePaths := make(map[string]bool)
+			dirPaths := make(map[string]bool)
+			collectNodePaths(root, filePaths, dirPaths)
 
-			const maxDetailedLines = 30
+			subtreeTokens := make(map[string]int, len(filePaths)+len(dirPaths))
+			subtreeFiles := make(map[string]int, len(filePaths)+len(dirPaths))
+			computeSubtreeTokenStats(root, countsByLabel, subtreeTokens, subtreeFiles)
+
+			pathTokens := subtreeTokens[root.Path]
+			nonPathTokens := totalTokens - pathTokens
+
 			fmt.Printf("\nmodel: %s\n", model)
-			fmt.Printf("top contributors (by tokens):\n")
-			limit := maxDetailedLines
-			if len(counts) < limit {
-				limit = len(counts)
+			fmt.Printf("path tokens: %d\n", pathTokens)
+			fmt.Printf("non-path tokens: %d\n", nonPathTokens)
+
+			type item struct {
+				Label  string
+				Path   string
+				Tokens int
+				Files  int
+				IsDir  bool
 			}
-			for i := 0; i < limit; i++ {
-				fmt.Printf("%d\t%s\n", counts[i].Tokens, counts[i].Label)
+
+			sortItems := func(items []item) {
+				sort.Slice(items, func(i, j int) bool {
+					if items[i].Tokens == items[j].Tokens {
+						return items[i].Label < items[j].Label
+					}
+					return items[i].Tokens > items[j].Tokens
+				})
 			}
-			if sumTop := func() int {
-				n := 0
-				for i := 0; i < limit; i++ {
-					n += counts[i].Tokens
+
+			const maxTopLevelLines = 20
+			topLevel := make([]item, 0, len(root.Children))
+			for _, child := range root.Children {
+				tok := subtreeTokens[child.Path]
+				if tok == 0 {
+					continue
 				}
-				return n
-			}(); sumTop < totalTokens {
-				fmt.Printf("...\n%d\t%s\n", totalTokens-sumTop, "[remaining]")
+				label := child.Path
+				if child.IsDir {
+					label = formatDirPathForReport(child.Path)
+				}
+				topLevel = append(topLevel, item{
+					Label:  label,
+					Path:   child.Path,
+					Tokens: tok,
+					Files:  subtreeFiles[child.Path],
+					IsDir:  child.IsDir,
+				})
+			}
+			sortItems(topLevel)
+
+			fmt.Printf("\ntop-level (by path tokens):\n")
+			topLevelLimit := maxTopLevelLines
+			if len(topLevel) < topLevelLimit {
+				topLevelLimit = len(topLevel)
+			}
+			for i := 0; i < topLevelLimit; i++ {
+				if topLevel[i].IsDir {
+					fmt.Printf("%d\t%s\t(%s, %d files)\n", topLevel[i].Tokens, topLevel[i].Label, formatPercent(topLevel[i].Tokens, pathTokens), topLevel[i].Files)
+					continue
+				}
+				fmt.Printf("%d\t%s\t(%s)\n", topLevel[i].Tokens, topLevel[i].Label, formatPercent(topLevel[i].Tokens, pathTokens))
+			}
+			if len(topLevel) > topLevelLimit {
+				fmt.Printf("...\n")
+			}
+
+			fmt.Printf("\ndominant path:\n")
+			current := root
+			for depth := 0; depth < 8; depth++ {
+				var best *FileEntry
+				bestTokens := 0
+				for _, child := range current.Children {
+					tok := subtreeTokens[child.Path]
+					if tok > bestTokens {
+						bestTokens = tok
+						best = child
+					}
+				}
+				if best == nil || bestTokens == 0 {
+					break
+				}
+				label := best.Path
+				if best.IsDir {
+					label = formatDirPathForReport(best.Path)
+					fmt.Printf("%d\t%s\t(%s, %d files)\n", bestTokens, label, formatPercent(bestTokens, pathTokens), subtreeFiles[best.Path])
+					current = best
+					continue
+				}
+				fmt.Printf("%d\t%s\t(%s)\n", bestTokens, label, formatPercent(bestTokens, pathTokens))
+				break
+			}
+
+			const maxDirLines = 20
+			dirs := make([]item, 0, len(dirPaths))
+			for dir := range dirPaths {
+				if dir == root.Path {
+					continue
+				}
+				tok := subtreeTokens[dir]
+				if tok == 0 {
+					continue
+				}
+				dirs = append(dirs, item{
+					Label:  formatDirPathForReport(dir),
+					Path:   dir,
+					Tokens: tok,
+					Files:  subtreeFiles[dir],
+					IsDir:  true,
+				})
+			}
+			sortItems(dirs)
+
+			fmt.Printf("\ntop directories (subtree):\n")
+			dirLimit := maxDirLines
+			if len(dirs) < dirLimit {
+				dirLimit = len(dirs)
+			}
+			for i := 0; i < dirLimit; i++ {
+				fmt.Printf("%d\t%s\t(%s, %d files)\n", dirs[i].Tokens, dirs[i].Label, formatPercent(dirs[i].Tokens, pathTokens), dirs[i].Files)
+			}
+			if len(dirs) > dirLimit {
+				fmt.Printf("...\n")
+			}
+
+			const maxFileLines = 20
+			files := make([]item, 0, len(filePaths))
+			for fp := range filePaths {
+				tok := subtreeTokens[fp]
+				if tok == 0 {
+					continue
+				}
+				files = append(files, item{
+					Label:  fp,
+					Path:   fp,
+					Tokens: tok,
+					Files:  1,
+					IsDir:  false,
+				})
+			}
+			sortItems(files)
+
+			fmt.Printf("\ntop files:\n")
+			fileLimit := maxFileLines
+			if len(files) < fileLimit {
+				fileLimit = len(files)
+			}
+			for i := 0; i < fileLimit; i++ {
+				fmt.Printf("%d\t%s\t(%s)\n", files[i].Tokens, files[i].Label, formatPercent(files[i].Tokens, pathTokens))
+			}
+			if len(files) > fileLimit {
+				fmt.Printf("...\n")
+			}
+
+			const maxOtherLines = 15
+			others := make([]item, 0, len(countsByLabel))
+			for label, n := range countsByLabel {
+				if n == 0 {
+					continue
+				}
+				if filePaths[label] || dirPaths[label] {
+					continue
+				}
+				others = append(others, item{Label: label, Path: label, Tokens: n})
+			}
+			sortItems(others)
+
+			if len(others) > 0 {
+				fmt.Printf("\nother sections:\n")
+				otherLimit := maxOtherLines
+				if len(others) < otherLimit {
+					otherLimit = len(others)
+				}
+				for i := 0; i < otherLimit; i++ {
+					fmt.Printf("%d\t%s\n", others[i].Tokens, others[i].Label)
+				}
+				if len(others) > otherLimit {
+					fmt.Printf("...\n")
+				}
 			}
 			return nil
 		}

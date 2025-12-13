@@ -157,7 +157,7 @@ End of snapshot
 ### Token Counting
 If you want to estimate how many tokens the *full output* would be for an OpenAI model (without actually printing it), use:
 - `--tcount`: prints the total token count (equivalent to `flatten | tcount`)
-- `--tcount-detailed`: prints the total plus a breakdown of the largest contributors
+- `--tcount-detailed`: prints the total plus a breakdown of the largest contributors (top-level, directories, files, and other sections)
 - `--tcount-model`: sets the model used for counting (defaults to `--tokens-model`)
 
 Examples:
