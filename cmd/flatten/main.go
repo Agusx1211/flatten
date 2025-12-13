@@ -609,11 +609,12 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			}
 			return
 		}
-		hash := calculateFileHash([]byte(contentStr))
+		// Deduplicate based on the original file bytes, not the (possibly compressed) rendered output.
+		hash := calculateFileHash(entry.Content)
 		if existing, exists := fileHashes[hash]; exists {
 			w.WriteString(fmt.Sprintf("- content: Contents are identical to %s\n", existing.Path))
 		} else {
-			fileHashes[hash] = &FileHash{Path: entry.Path, Hash: hash, Content: []byte(contentStr)}
+			fileHashes[hash] = &FileHash{Path: entry.Path, Hash: hash, Content: entry.Content}
 			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
 		}
 		if sections != nil {
