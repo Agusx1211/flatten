@@ -870,6 +870,9 @@ subdirectories and their contents for each provided directory.`,
 		if tcount && dryRun {
 			return fmt.Errorf("--tcount/--tcount-detailed cannot be used with --dry-run")
 		}
+		if showTokens && dryRun {
+			return fmt.Errorf("--tokens cannot be used with --dry-run")
+		}
 
 		// Validate markdown delimiter
 		if markdownDelimiter != "auto" {
