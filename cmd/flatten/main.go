@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +42,12 @@ type FileHash struct {
 	Content []byte
 }
 
+type OutputSection struct {
+	Label string
+	Start int
+	End   int
+}
+
 // Flags
 var (
 	includeGitIgnore    bool
@@ -61,6 +68,10 @@ var (
 
 	showTokens  bool
 	tokensModel string
+
+	tcount         bool
+	tcountDetailed bool
+	tcountModel    string
 
 	includePatterns []string
 	excludePatterns []string
@@ -467,8 +478,12 @@ func compressRepeatedBlocks(s string) (string, bool) {
 	return strings.Join(out, "\n"), changed
 }
 
-func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string, compCtx *CompressionContext) {
+func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[string]*FileHash, showTokens bool, delimiter string, compCtx *CompressionContext, sections *[]OutputSection) {
 	if !entry.IsDir {
+		start := 0
+		if sections != nil {
+			start = w.Len()
+		}
 		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 		if showAllMetadata || showLastUpdated {
 			w.WriteString(fmt.Sprintf("- last updated: %s\n", time.Unix(entry.ModTime, 0).Format(time.RFC3339)))
@@ -513,6 +528,9 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 		}
 		if noFileDeduplication {
 			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
+			if sections != nil {
+				*sections = append(*sections, OutputSection{Label: entry.Path, Start: start, End: w.Len()})
+			}
 			return
 		}
 		hash := calculateFileHash([]byte(contentStr))
@@ -522,14 +540,24 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			fileHashes[hash] = &FileHash{Path: entry.Path, Hash: hash, Content: []byte(contentStr)}
 			w.WriteString(fmt.Sprintf("- content:\n%s\n%s\n%s\n", delimiter, contentStr, delimiter))
 		}
+		if sections != nil {
+			*sections = append(*sections, OutputSection{Label: entry.Path, Start: start, End: w.Len()})
+		}
 		return
 	}
 	if showTokens {
+		start := 0
+		if sections != nil {
+			start = w.Len()
+		}
 		w.WriteString(fmt.Sprintf("\n- path: %s\n", entry.Path))
 		w.WriteString(fmt.Sprintf("- dir tokens: %d\n", entry.Tokens))
+		if sections != nil {
+			*sections = append(*sections, OutputSection{Label: entry.Path, Start: start, End: w.Len()})
+		}
 	}
 	for _, child := range entry.Children {
-		printFlattenedOutput(child, w, fileHashes, showTokens, delimiter, compCtx)
+		printFlattenedOutput(child, w, fileHashes, showTokens, delimiter, compCtx, sections)
 	}
 }
 
@@ -580,29 +608,100 @@ func runCommands(cmds []string) []CommandResult {
 	return results
 }
 
+func composeFinalOutput(content string, prefix string, suffix string) string {
+	hasPrefix := strings.TrimSpace(prefix) != ""
+	hasSuffix := strings.TrimSpace(suffix) != ""
+
+	var out strings.Builder
+	if hasPrefix {
+		out.WriteString(prefix)
+		out.WriteString("\n")
+	}
+	if hasPrefix || hasSuffix {
+		out.WriteString("---\n")
+	}
+	out.WriteString(content)
+	if hasPrefix || hasSuffix {
+		out.WriteString("---\n")
+	}
+	if hasSuffix {
+		out.WriteString(suffix)
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+func fillSectionGaps(sections []OutputSection, totalLen int) []OutputSection {
+	if totalLen < 0 {
+		totalLen = 0
+	}
+	if len(sections) == 0 {
+		return []OutputSection{{Label: "[all]", Start: 0, End: totalLen}}
+	}
+	sort.Slice(sections, func(i, j int) bool {
+		if sections[i].Start == sections[j].Start {
+			return sections[i].End < sections[j].End
+		}
+		return sections[i].Start < sections[j].Start
+	})
+
+	out := make([]OutputSection, 0, len(sections)+2)
+	cursor := 0
+	for _, s := range sections {
+		if s.End <= s.Start {
+			continue
+		}
+		if s.Start > cursor {
+			out = append(out, OutputSection{Label: "[other]", Start: cursor, End: s.Start})
+		}
+		if s.Start < cursor {
+			s.Start = cursor
+		}
+		if s.End <= s.Start {
+			continue
+		}
+		out = append(out, s)
+		cursor = s.End
+	}
+	if cursor < totalLen {
+		out = append(out, OutputSection{Label: "[other]", Start: cursor, End: totalLen})
+	}
+	if len(out) > 0 && out[0].Start != 0 {
+		out = append([]OutputSection{{Label: "[other]", Start: 0, End: out[0].Start}}, out...)
+	}
+	return out
+}
+
+func tokenCountsBySection(tkm *tiktoken.Tiktoken, tokens []int, sections []OutputSection) (int, map[string]int) {
+	counts := make(map[string]int, len(sections))
+	if len(sections) == 0 {
+		return len(tokens), counts
+	}
+
+	sectionIdx := 0
+	byteOffset := 0
+	single := make([]int, 1)
+	for _, tok := range tokens {
+		for sectionIdx < len(sections) && byteOffset >= sections[sectionIdx].End {
+			sectionIdx++
+		}
+		label := "[unattributed]"
+		if sectionIdx < len(sections) && byteOffset >= sections[sectionIdx].Start && byteOffset < sections[sectionIdx].End {
+			label = sections[sectionIdx].Label
+		}
+		counts[label]++
+		single[0] = tok
+		byteOffset += len(tkm.Decode(single))
+	}
+	return len(tokens), counts
+}
+
 // printFinalOutput prints optional prefix, then wraps only the main content
 // with --- lines, and finally prints optional suffix. If either prefix or
 // suffix is provided, the content is surrounded by --- lines. The prefix has
 // --- only after it; the suffix has --- only before it.
 func printFinalOutput(content string, prefix, suffix string) {
-	hasPrefix := strings.TrimSpace(prefix) != ""
-	hasSuffix := strings.TrimSpace(suffix) != ""
-
-	if hasPrefix {
-		fmt.Println(prefix)
-	}
-	if hasPrefix || hasSuffix {
-		fmt.Println("---")
-	}
-
-	fmt.Print(content)
-
-	if hasPrefix || hasSuffix {
-		fmt.Println("---")
-	}
-	if hasSuffix {
-		fmt.Println(suffix)
-	}
+	fmt.Print(composeFinalOutput(content, prefix, suffix))
 }
 
 func printDryRunOutput(entry *FileEntry, w *strings.Builder) {
@@ -638,6 +737,13 @@ subdirectories and their contents for each provided directory.`,
 			args = []string{"."}
 		}
 
+		if tcountDetailed {
+			tcount = true
+		}
+		if tcount && dryRun {
+			return fmt.Errorf("--tcount/--tcount-detailed cannot be used with --dry-run")
+		}
+
 		// Validate markdown delimiter
 		if markdownDelimiter != "auto" {
 			validDelimiter := false
@@ -662,6 +768,11 @@ subdirectories and their contents for each provided directory.`,
 		}
 
 		var output strings.Builder
+		var sections []OutputSection
+		sectionsPtr := (*[]OutputSection)(nil)
+		if tcountDetailed {
+			sectionsPtr = &sections
+		}
 
 		// Create a root entry that will contain all directories
 		root := &FileEntry{
@@ -711,11 +822,15 @@ subdirectories and their contents for each provided directory.`,
 		}
 
 		// Write a single map for all directories
+		headerStart := output.Len()
 		output.WriteString(fmt.Sprintf("\nTotal files: %d\n", getTotalFiles(root)))
 		if showTotalSize {
 			output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
 		}
 		output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTree(root, "", false, showTokens)))
+		if sectionsPtr != nil {
+			*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[header]", Start: headerStart, End: output.Len()})
+		}
 
 		// Determine the markdown delimiter
 		delimiter := markdownDelimiter
@@ -766,12 +881,19 @@ subdirectories and their contents for each provided directory.`,
 			}
 		}
 
-		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter, compCtx)
+		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter, compCtx, sectionsPtr)
 
 		// If commands were requested, run them and append a detailed report
 		if len(commands) > 0 {
-			output.WriteString("\nCommands execution:\n")
+			if sectionsPtr != nil {
+				start := output.Len()
+				output.WriteString("\nCommands execution:\n")
+				*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[commands]", Start: start, End: output.Len()})
+			} else {
+				output.WriteString("\nCommands execution:\n")
+			}
 			for _, r := range cmdResults {
+				cmdStart := output.Len()
 				output.WriteString(fmt.Sprintf("\n- command: %s\n", r.Command))
 				output.WriteString(fmt.Sprintf("- started: %s\n", r.StartTime.Format(time.RFC3339Nano)))
 				output.WriteString(fmt.Sprintf("- finished: %s\n", r.EndTime.Format(time.RFC3339Nano)))
@@ -809,33 +931,166 @@ subdirectories and their contents for each provided directory.`,
 				} else {
 					output.WriteString("- stderr: (empty)\n")
 				}
+				if sectionsPtr != nil {
+					*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[command] " + r.Command, Start: cmdStart, End: output.Len()})
+				}
 			}
 		}
 
 		// If compression applied, prepend a tiny legend and append extracted blobs
-		finalStr := output.String()
+		outputStr := output.String()
+		finalStr := outputStr
+		legendStr := ""
+		blobsStr := ""
+		var blobSections []OutputSection
 		if compCtx != nil && compCtx.Applied {
 			var legend strings.Builder
 			legend.WriteString("Compression applied:\n")
 			legend.WriteString("- Repeated lines/groups shown once + (...<<<repeats N times>>>...)\n")
 			legend.WriteString("- Large repeated blobs replaced with <<<blob-id>>> and listed at end\n\n")
+			legendStr = legend.String()
+
 			// Append blobs section only for used IDs
 			var blobsSection strings.Builder
+			blobHeaderStart := blobsSection.Len()
 			blobsSection.WriteString("\nExtracted blobs:\n")
+			if sectionsPtr != nil {
+				blobSections = append(blobSections, OutputSection{Label: "[blobs]", Start: blobHeaderStart, End: blobsSection.Len()})
+			}
 			anyBlob := false
 			for id := range compCtx.UsedBlobIDs {
 				if def, ok := compCtx.BlobsByID[id]; ok {
 					anyBlob = true
+					blobStart := blobsSection.Len()
 					blobsSection.WriteString(fmt.Sprintf("\n- id: %s\n", id))
 					blobsSection.WriteString("- content:\n")
 					blobsSection.WriteString(fmt.Sprintf("%s\n%s\n%s\n", delimiter, def.Content, delimiter))
+					if sectionsPtr != nil {
+						blobSections = append(blobSections, OutputSection{Label: "[blob] " + id, Start: blobStart, End: blobsSection.Len()})
+					}
 				}
 			}
 			if anyBlob {
-				finalStr = legend.String() + finalStr + blobsSection.String()
+				blobsStr = blobsSection.String()
 			} else {
-				finalStr = legend.String() + finalStr
+				blobsStr = ""
+				blobSections = nil
 			}
+
+			finalStr = legendStr + outputStr + blobsStr
+		}
+
+		if tcount {
+			model := tokensModel
+			if strings.TrimSpace(tcountModel) != "" {
+				model = tcountModel
+			}
+			tkm, err := tiktoken.EncodingForModel(model)
+			if err != nil {
+				return fmt.Errorf("failed to get tokenizer for model %q: %w", model, err)
+			}
+
+			printed := composeFinalOutput(finalStr, prefixMessage, suffixMessage)
+			tokens := tkm.Encode(printed, nil, nil)
+			totalTokens := len(tokens)
+
+			fmt.Println(totalTokens)
+			if !tcountDetailed {
+				return nil
+			}
+
+			// Build sections for the fully printed output so we can attribute tokens.
+			if sectionsPtr == nil {
+				return fmt.Errorf("internal error: expected sections to be enabled for --tcount-detailed")
+			}
+
+			contentSections := sections
+			if legendStr != "" {
+				legendLen := len(legendStr)
+				for i := range contentSections {
+					contentSections[i].Start += legendLen
+					contentSections[i].End += legendLen
+				}
+				contentSections = append([]OutputSection{{Label: "[legend]", Start: 0, End: legendLen}}, contentSections...)
+			}
+			if blobsStr != "" && len(blobSections) > 0 {
+				shift := len(legendStr) + len(outputStr)
+				for _, s := range blobSections {
+					contentSections = append(contentSections, OutputSection{Label: s.Label, Start: s.Start + shift, End: s.End + shift})
+				}
+			}
+
+			hasPrefix := strings.TrimSpace(prefixMessage) != ""
+			hasSuffix := strings.TrimSpace(suffixMessage) != ""
+			wrapper := "---\n"
+
+			finalSections := make([]OutputSection, 0, len(contentSections)+4)
+			offset := 0
+			if hasPrefix {
+				p := prefixMessage + "\n"
+				finalSections = append(finalSections, OutputSection{Label: "[prefix]", Start: offset, End: offset + len(p)})
+				offset += len(p)
+			}
+			if hasPrefix || hasSuffix {
+				finalSections = append(finalSections, OutputSection{Label: "[wrapper]", Start: offset, End: offset + len(wrapper)})
+				offset += len(wrapper)
+			}
+			for _, s := range contentSections {
+				finalSections = append(finalSections, OutputSection{Label: s.Label, Start: s.Start + offset, End: s.End + offset})
+			}
+			offset += len(finalStr)
+			if hasPrefix || hasSuffix {
+				finalSections = append(finalSections, OutputSection{Label: "[wrapper]", Start: offset, End: offset + len(wrapper)})
+				offset += len(wrapper)
+			}
+			if hasSuffix {
+				s := suffixMessage + "\n"
+				finalSections = append(finalSections, OutputSection{Label: "[suffix]", Start: offset, End: offset + len(s)})
+				offset += len(s)
+			}
+
+			if offset != len(printed) {
+				// Keep going; token counts will be best-effort.
+			}
+
+			finalSections = fillSectionGaps(finalSections, len(printed))
+			totalTokens, countsByLabel := tokenCountsBySection(tkm, tokens, finalSections)
+
+			type labeledCount struct {
+				Label  string
+				Tokens int
+			}
+			counts := make([]labeledCount, 0, len(countsByLabel))
+			for label, n := range countsByLabel {
+				counts = append(counts, labeledCount{Label: label, Tokens: n})
+			}
+			sort.Slice(counts, func(i, j int) bool {
+				if counts[i].Tokens == counts[j].Tokens {
+					return counts[i].Label < counts[j].Label
+				}
+				return counts[i].Tokens > counts[j].Tokens
+			})
+
+			const maxDetailedLines = 30
+			fmt.Printf("\nmodel: %s\n", model)
+			fmt.Printf("top contributors (by tokens):\n")
+			limit := maxDetailedLines
+			if len(counts) < limit {
+				limit = len(counts)
+			}
+			for i := 0; i < limit; i++ {
+				fmt.Printf("%d\t%s\n", counts[i].Tokens, counts[i].Label)
+			}
+			if sumTop := func() int {
+				n := 0
+				for i := 0; i < limit; i++ {
+					n += counts[i].Tokens
+				}
+				return n
+			}(); sumTop < totalTokens {
+				fmt.Printf("...\n%d\t%s\n", totalTokens-sumTop, "[remaining]")
+			}
+			return nil
 		}
 
 		printFinalOutput(finalStr, prefixMessage, suffixMessage)
@@ -861,7 +1116,11 @@ func init() {
 	rootCmd.Flags().BoolVarP(&showTotalSize, "show-total-size", "Z", false, "Show total size of all files")
 
 	rootCmd.Flags().BoolVarP(&showTokens, "tokens", "t", false, "Show token usage for each file/directory")
-	rootCmd.Flags().StringVar(&tokensModel, "tokens-model", "gpt-4o-mini", "Model to use for token counting")
+	rootCmd.Flags().StringVar(&tokensModel, "tokens-model", "gpt-4o-mini", "Model to use for --tokens (per-file token counting)")
+
+	rootCmd.Flags().BoolVar(&tcount, "tcount", false, "Print token count of the full output (equivalent to: flatten | tcount)")
+	rootCmd.Flags().BoolVar(&tcountDetailed, "tcount-detailed", false, "Print token count and a breakdown of token usage by path/section")
+	rootCmd.Flags().StringVar(&tcountModel, "tcount-model", "", "Model to use for token-counting the full output (defaults to --tokens-model)")
 
 	rootCmd.Flags().StringSliceVarP(&includePatterns, "include", "I", []string{}, "Include only files matching these patterns (e.g. '*.go,*.js')")
 	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "E", []string{}, "Exclude files matching these patterns (e.g. '*.test.js')")

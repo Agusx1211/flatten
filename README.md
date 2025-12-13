@@ -154,6 +154,19 @@ End of snapshot
 ---
 ```
 
+### Token Counting
+If you want to estimate how many tokens the *full output* would be for an OpenAI model (without actually printing it), use:
+- `--tcount`: prints the total token count (equivalent to `flatten | tcount`)
+- `--tcount-detailed`: prints the total plus a breakdown of the largest contributors
+- `--tcount-model`: sets the model used for counting (defaults to `--tokens-model`)
+
+Examples:
+```bash
+flatten . --tcount
+flatten . --tcount-detailed
+flatten . --tcount --tcount-model gpt-4o-mini
+```
+
 ## License
 MIT License
 
