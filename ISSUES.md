@@ -5,25 +5,6 @@ Collected on Linux (arm64) with Go `go1.25.5` by:
 - Running `go test ./...` and `go vet ./...`
 - Manually exercising flags via the built `./bin/flatten`
 
-## 3) Directory-only `--include` patterns can exclude everything (root is not includable)
-
-**Symptoms**
-- Directory-only includes (patterns ending in `/`) can produce `Total files: 0` even when matching directories exist.
-- Adding `--include "."` doesn’t help; it’s effectively ignored.
-
-**Repro**
-- In this repo: `flatten . --dry-run --include "cmd/"` → `Total files: 0`
-- Also: `flatten . --dry-run --include "cmd/" --include "."` → still `Total files: 0`
-
-**Likely cause**
-- `compilePatterns()` drops patterns that normalize to an empty pattern without `dirOnly` (so `"."`/`"./"` can’t be used to match root).
-- When any `dirOnly` include exists, directories must match an include pattern (`hasDirOnlyIncludes` gate), and `"."` doesn’t match `"cmd"` etc.
-
-**Refs**
-- `cmd/flatten/filter.go:107` (dir pruning when `hasDirOnlyIncludes`)
-- `cmd/flatten/filter.go:276` (drops empty patterns like `"."`)
-- `cmd/flatten/filter.go:288` (normalizes `"."` to empty)
-
 ## 5) `--prefix` / `--suffix` wrapping doesn’t match README’s example
 
 **Symptoms**

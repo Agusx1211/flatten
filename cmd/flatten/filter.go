@@ -95,12 +95,6 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		}
 	}
 
-	if isDir && f.hasDirOnlyIncludes && len(f.includePatterns) > 0 {
-		if !f.matchesPatterns(relPath, true, f.includePatterns) {
-			return false
-		}
-	}
-
 	if !isDir && len(f.includePatterns) > 0 {
 		if !f.matchesPatterns(relPath, false, f.includePatterns) {
 			return false
@@ -335,16 +329,26 @@ func (f *Filter) matchesPatterns(relPath string, isDir bool, patterns []globPatt
 	for _, pattern := range patterns {
 		if pattern.pattern == "" {
 			if pattern.dirOnly {
-				if isDir {
-					return true
-				}
-				continue
+				return true
 			}
 			if normalized == "" || normalized == "." {
 				return true
 			}
 		}
-		if pattern.dirOnly && !isDir {
+		if pattern.dirOnly {
+			dirPath := normalized
+			if !isDir {
+				dirPath = path.Dir(normalized)
+			}
+			subtree := ""
+			if strings.Contains(pattern.pattern, "/") {
+				subtree = path.Join(pattern.pattern, "**")
+			} else {
+				subtree = path.Join("**", pattern.pattern, "**")
+			}
+			if matchGlob(subtree, dirPath) {
+				return true
+			}
 			continue
 		}
 		if matchGlob(pattern.pattern, normalized) {
