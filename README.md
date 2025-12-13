@@ -107,14 +107,14 @@ Flags:
   -g, --include-git         Include .git directory and its contents
   -i, --include-gitignore   Include files that would normally be ignored by .gitignore
       --include-locks       Include lock files (package-lock.json, yarn.lock, etc.)
-  -l, --last-updated        Show last updated time for each file
-      --no-dedup            Disable file deduplication
-      --prefix              Optional message printed before output, wrapped by --- lines
-      --suffix              Optional message printed after output, wrapped by --- lines
-  -c, --show-checksum       Show SHA256 checksum of files
-  -M, --show-mime           Show file MIME types
-  -m, --show-mode           Show file permissions
-  -o, --show-owner          Show file owner and group
+	  -l, --last-updated        Show last updated time for each file
+	      --no-dedup            Disable file deduplication
+	      --prefix              Optional message printed before output
+	      --suffix              Optional message printed after output
+	  -c, --show-checksum       Show SHA256 checksum of files
+	  -M, --show-mime           Show file MIME types
+	  -m, --show-mode           Show file permissions
+	  -o, --show-owner          Show file owner and group
   -z, --show-size           Show individual file sizes
   -Z, --show-total-size     Show total size of all files
       --compress            Compress output by collapsing repeats and extracting large repeated blobs
@@ -134,7 +134,7 @@ Examples:
 - `flatten repoA repoB --command "ls -la"`
 
 ### Optional Output Wrapping
-Use `--prefix` and/or `--suffix` to add custom messages around the entire output. When provided, each is wrapped by delimiter lines `---` to make them easy to spot.
+Use `--prefix` and/or `--suffix` to add custom messages before/after the output. When either flag is provided, the main flatten output is wrapped by delimiter lines `---`.
 
 Example:
 
@@ -145,13 +145,11 @@ flatten . --prefix "Start of snapshot" --suffix "End of snapshot"
 This prints:
 
 ```
----
 Start of snapshot
 ---
 ...<flatten output here>...
 ---
 End of snapshot
----
 ```
 
 ### Token Counting

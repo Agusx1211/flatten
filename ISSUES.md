@@ -5,27 +5,6 @@ Collected on Linux (arm64) with Go `go1.25.5` by:
 - Running `go test ./...` and `go vet ./...`
 - Manually exercising flags via the built `./bin/flatten`
 
-## 5) `--prefix` / `--suffix` wrapping doesn’t match README’s example
-
-**Symptoms**
-- Output looks like:
-  - `Start`
-  - `---`
-  - `<content>`
-  - `---`
-  - `End`
-- README shows prefix/suffix each wrapped by `---` lines (including a leading `---` before the prefix and a trailing `---` after the suffix).
-
-**Repro**
-- `flatten . --dry-run --prefix "Start" --suffix "End"`
-
-**Likely cause**
-- Wrapper lines are only emitted between prefix/content and content/suffix (not around prefix/suffix as separate blocks).
-
-**Refs**
-- `cmd/flatten/main.go:611` (`composeFinalOutput`)
-- `README.md` (“Optional Output Wrapping” section)
-
 ## 8) `build.sh` uses `set -e` but also checks `$?` (failure branch won’t run)
 
 **Symptoms**
