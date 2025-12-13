@@ -54,3 +54,23 @@ func readFlattenFile(path string, profile string) (*flattenRuleSet, error) {
 		exclude: exclude,
 	}, nil
 }
+
+func flattenFileProfileInfo(path string, profile string) (hasProfiles bool, hasProfile bool, hasDefault bool, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, false, false, err
+	}
+
+	var cfg flattenFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return false, false, false, fmt.Errorf("failed to parse flatten file: %w", err)
+	}
+
+	if len(cfg.Profiles) == 0 {
+		return false, false, false, nil
+	}
+
+	_, hasProfile = cfg.Profiles[profile]
+	_, hasDefault = cfg.Profiles["default"]
+	return true, hasProfile, hasDefault, nil
+}

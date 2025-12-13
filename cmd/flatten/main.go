@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"mime"
@@ -962,8 +963,33 @@ subdirectories and their contents for each provided directory.`,
 			Children: make([]*FileEntry, 0),
 		}
 
+		profileExplicit := cmd.Flags().Changed("profile")
+
 		// Process each directory and add it to the root
 		for _, dir := range args {
+			// Surface common --profile typos by warning when the top-level .flatten
+			// defines profiles but the requested one is missing.
+			if profileExplicit {
+				flattenPath := filepath.Join(dir, flattenFileName)
+				info, err := os.Stat(flattenPath)
+				switch {
+				case err == nil && !info.IsDir():
+					hasProfiles, hasProfile, hasDefault, err := flattenFileProfileInfo(flattenPath, profileName)
+					if err != nil {
+						return fmt.Errorf("failed to parse %s: %w", flattenPath, err)
+					}
+					if hasProfiles && !hasProfile {
+						if hasDefault {
+							fmt.Fprintf(os.Stderr, "warning: profile %q not found in %s; using profiles.default\n", profileName, flattenPath)
+						} else {
+							fmt.Fprintf(os.Stderr, "warning: profile %q not found in %s; using base include/exclude rules\n", profileName, flattenPath)
+						}
+					}
+				case err != nil && !os.IsNotExist(err) && !errors.Is(err, fs.ErrPermission):
+					return fmt.Errorf("failed to stat %s: %w", flattenPath, err)
+				}
+			}
+
 			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includeLocks, includePatterns, excludePatterns, profileName)
 			if err != nil {
 				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
