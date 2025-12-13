@@ -95,12 +95,30 @@ var (
 // Available markdown delimiters in order of preference for auto-detection
 var availableDelimiters = []string{"```", "~~~", "`````", "~~~~~", "~~~~~~~~~~~"}
 
-// detectBestDelimiter scans all files and returns the first delimiter that's not used
-func detectBestDelimiter(root *FileEntry) string {
+func scanTextForDelimiters(content string, usedDelimiters map[string]bool) {
+	for _, delimiter := range availableDelimiters {
+		if strings.Contains(content, delimiter) {
+			usedDelimiters[delimiter] = true
+		}
+	}
+}
+
+// detectBestDelimiter scans all files (and optional command outputs) and returns the first delimiter that's not used
+func detectBestDelimiter(root *FileEntry, cmdResults []CommandResult) string {
 	usedDelimiters := make(map[string]bool)
 
 	// Recursively scan all files for delimiter usage
 	scanForDelimiters(root, usedDelimiters)
+
+	// Also scan command stdout/stderr since those are wrapped in a delimiter too.
+	for _, r := range cmdResults {
+		if r.Stdout != "" {
+			scanTextForDelimiters(r.Stdout, usedDelimiters)
+		}
+		if r.Stderr != "" {
+			scanTextForDelimiters(r.Stderr, usedDelimiters)
+		}
+	}
 
 	// Return the first delimiter that's not used
 	for _, delimiter := range availableDelimiters {
@@ -116,12 +134,7 @@ func detectBestDelimiter(root *FileEntry) string {
 // scanForDelimiters recursively scans files for delimiter usage
 func scanForDelimiters(entry *FileEntry, usedDelimiters map[string]bool) {
 	if !entry.IsDir {
-		content := string(entry.Content)
-		for _, delimiter := range availableDelimiters {
-			if strings.Contains(content, delimiter) {
-				usedDelimiters[delimiter] = true
-			}
-		}
+		scanTextForDelimiters(string(entry.Content), usedDelimiters)
 	} else {
 		for _, child := range entry.Children {
 			scanForDelimiters(child, usedDelimiters)
@@ -946,20 +959,21 @@ subdirectories and their contents for each provided directory.`,
 			*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[header]", Start: headerStart, End: output.Len()})
 		}
 
-		// Determine the markdown delimiter
-		delimiter := markdownDelimiter
-		if delimiter == "auto" {
-			delimiter = detectBestDelimiter(root)
-		}
-
-		fileHashes := make(map[string]*FileHash)
-
 		// If commands were requested, run them now so their outputs can be included
-		// in compression blob indexing while preserving the final print order below.
+		// in delimiter auto-detection and compression blob indexing while preserving
+		// the final print order below.
 		var cmdResults []CommandResult
 		if len(commands) > 0 {
 			cmdResults = runCommands(commands)
 		}
+
+		// Determine the markdown delimiter
+		delimiter := markdownDelimiter
+		if delimiter == "auto" {
+			delimiter = detectBestDelimiter(root, cmdResults)
+		}
+
+		fileHashes := make(map[string]*FileHash)
 
 		// Prepare compression context when enabled
 		var compCtx *CompressionContext
