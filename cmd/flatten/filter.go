@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"mime"
 	"net/http"
 	"os"
@@ -14,14 +15,16 @@ import (
 
 // Filter handles file filtering logic
 type Filter struct {
-	gitIgnore       *ignore.GitIgnore
-	includeAll      bool
-	includeGit      bool
-	includeBin      bool
-	includeLocks    bool
-	baseDir         string
-	includePatterns []globPattern
-	excludePatterns []globPattern
+	gitIgnore          *ignore.GitIgnore
+	includeAll         bool
+	includeGit         bool
+	includeBin         bool
+	includeLocks       bool
+	baseDir            string
+	includePatterns    []globPattern
+	excludePatterns    []globPattern
+	profile            string
+	hasDirOnlyIncludes bool
 }
 
 type globPattern struct {
@@ -39,18 +42,21 @@ func NewFilter(
 	includeLocks bool,
 	includePatterns []string,
 	excludePatterns []string,
+	profile string,
 ) (*Filter, error) {
 	compiledIncludes := compilePatterns(includePatterns)
 	compiledExcludes := compilePatterns(excludePatterns)
 
 	f := &Filter{
-		includeAll:      includeGitIgnore,
-		includeGit:      includeGit,
-		includeBin:      includeBin,
-		includeLocks:    includeLocks,
-		baseDir:         dir,
-		includePatterns: compiledIncludes,
-		excludePatterns: compiledExcludes,
+		includeAll:         includeGitIgnore,
+		includeGit:         includeGit,
+		includeBin:         includeBin,
+		includeLocks:       includeLocks,
+		baseDir:            dir,
+		includePatterns:    compiledIncludes,
+		excludePatterns:    compiledExcludes,
+		profile:            profile,
+		hasDirOnlyIncludes: hasDirOnlyPattern(compiledIncludes),
 	}
 
 	if !includeGitIgnore {
@@ -76,14 +82,6 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		return false
 	}
 
-	if !isDir {
-		if len(f.includePatterns) > 0 {
-			if !f.matchesPatterns(relPath, false, f.includePatterns) {
-				return false
-			}
-		}
-	}
-
 	if !f.includeGit {
 		relSlash := filepath.ToSlash(relPath)
 		base := filepath.Base(path)
@@ -106,6 +104,18 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 		}
 	}
 
+	if isDir && f.hasDirOnlyIncludes && len(f.includePatterns) > 0 {
+		if !f.matchesPatterns(relPath, true, f.includePatterns) {
+			return false
+		}
+	}
+
+	if !isDir && len(f.includePatterns) > 0 {
+		if !f.matchesPatterns(relPath, false, f.includePatterns) {
+			return false
+		}
+	}
+
 	if f.includeAll {
 		return true
 	}
@@ -119,6 +129,44 @@ func (f *Filter) ShouldInclude(info os.FileInfo, path string) bool {
 	}
 
 	return !f.gitIgnore.MatchesPath(relPath)
+}
+
+// WithFlattenFile returns a new Filter that includes the rules defined in a .flatten file found in dir.
+// If no .flatten file is present, the current filter is returned unchanged.
+func (f *Filter) WithFlattenFile(dir string) (*Filter, error) {
+	flattenPath := filepath.Join(dir, flattenFileName)
+	info, err := os.Stat(flattenPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return f, nil
+		}
+		return nil, fmt.Errorf("failed to stat %s: %w", flattenPath, err)
+	}
+	if info.IsDir() {
+		return f, nil
+	}
+
+	rules, err := readFlattenFile(flattenPath, f.profile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", flattenPath, err)
+	}
+
+	if rules == nil || (len(rules.include) == 0 && len(rules.exclude) == 0) {
+		return f, nil
+	}
+
+	relDir := f.relativePath(dir)
+	prefixedIncludes := prefixPatternsWithDir(rules.include, relDir)
+	prefixedExcludes := prefixPatternsWithDir(rules.exclude, relDir)
+
+	newIncludes := append(copyGlobPatterns(f.includePatterns), compilePatterns(prefixedIncludes)...)
+	newExcludes := append(copyGlobPatterns(f.excludePatterns), compilePatterns(prefixedExcludes)...)
+
+	nf := *f
+	nf.includePatterns = newIncludes
+	nf.excludePatterns = newExcludes
+	nf.hasDirOnlyIncludes = hasDirOnlyPattern(newIncludes)
+	return &nf, nil
 }
 
 func (f *Filter) isBinaryFile(path string) (bool, error) {
@@ -257,6 +305,58 @@ func normalizePattern(raw string) globPattern {
 	}
 	normalized = strings.TrimPrefix(normalized, "/")
 	return globPattern{pattern: normalized, dirOnly: dirOnly}
+}
+
+func hasDirOnlyPattern(patterns []globPattern) bool {
+	for _, pat := range patterns {
+		if pat.dirOnly {
+			return true
+		}
+	}
+	return false
+}
+
+func copyGlobPatterns(in []globPattern) []globPattern {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]globPattern, len(in))
+	copy(out, in)
+	return out
+}
+
+func prefixPatternsWithDir(patterns []string, dir string) []string {
+	if len(patterns) == 0 {
+		return patterns
+	}
+
+	cleanDir := strings.TrimSpace(dir)
+	cleanDir = strings.TrimPrefix(cleanDir, "./")
+	cleanDir = strings.TrimPrefix(cleanDir, "/")
+	cleanDir = strings.TrimSuffix(cleanDir, "/")
+	if cleanDir == "" || cleanDir == "." {
+		return patterns
+	}
+
+	result := make([]string, 0, len(patterns))
+	for _, raw := range patterns {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			result = append(result, trimmed)
+			continue
+		}
+		hasTrailingSlash := strings.HasSuffix(trimmed, "/")
+		normalized := strings.ReplaceAll(trimmed, "\\", "/")
+		normalized = strings.TrimPrefix(normalized, "/")
+		normalized = strings.TrimSuffix(normalized, "/")
+		joined := path.Join(cleanDir, normalized)
+		if hasTrailingSlash {
+			joined += "/"
+		}
+		result = append(result, joined)
+	}
+
+	return result
 }
 
 // isLockFile checks if a file is a lock file

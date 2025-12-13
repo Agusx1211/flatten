@@ -64,6 +64,7 @@ var (
 
 	includePatterns []string
 	excludePatterns []string
+	profileName     string
 
 	markdownDelimiter string
 	dryRun            bool
@@ -157,13 +158,21 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 		}
 		return entry, nil
 	}
+	childFilter := filter
+	if info.IsDir() {
+		updatedFilter, err := filter.WithFlattenFile(path)
+		if err != nil {
+			return nil, err
+		}
+		childFilter = updatedFilter
+	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read directory %s: %w", path, err)
 	}
 	for _, item := range entries {
 		childPath := filepath.Join(path, item.Name())
-		child, err := loadDirectory(childPath, filter, tokenizer)
+		child, err := loadDirectory(childPath, childFilter, tokenizer)
 		if err != nil {
 			return nil, err
 		}
@@ -195,13 +204,21 @@ func loadDirectoryDryRun(path string, filter *Filter) (*FileEntry, error) {
 	if !info.IsDir() {
 		return entry, nil
 	}
+	childFilter := filter
+	if info.IsDir() {
+		updatedFilter, err := filter.WithFlattenFile(path)
+		if err != nil {
+			return nil, err
+		}
+		childFilter = updatedFilter
+	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read directory %s: %w", path, err)
 	}
 	for _, item := range entries {
 		childPath := filepath.Join(path, item.Name())
-		child, err := loadDirectoryDryRun(childPath, filter)
+		child, err := loadDirectoryDryRun(childPath, childFilter)
 		if err != nil {
 			return nil, err
 		}
@@ -301,7 +318,7 @@ type CompressionContext struct {
 }
 
 const largeBlobThresholdBytes = 1024 // "sane" threshold for large repeated blobs
-const maxRepeatGroupLines = 16        // max group size to detect repeated line blocks
+const maxRepeatGroupLines = 16       // max group size to detect repeated line blocks
 
 // buildLargeBlobIndex walks all files and collects large repeated paragraphs across files
 func buildLargeBlobIndex(entry *FileEntry, idx map[string]*BlobDef) {
@@ -655,7 +672,7 @@ subdirectories and their contents for each provided directory.`,
 
 		// Process each directory and add it to the root
 		for _, dir := range args {
-			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includeLocks, includePatterns, excludePatterns)
+			filter, err := NewFilter(dir, includeGitIgnore, includeGit, includeBin, includeLocks, includePatterns, excludePatterns, profileName)
 			if err != nil {
 				return fmt.Errorf("failed to create filter for %s: %w", dir, err)
 			}
@@ -848,6 +865,7 @@ func init() {
 
 	rootCmd.Flags().StringSliceVarP(&includePatterns, "include", "I", []string{}, "Include only files matching these patterns (e.g. '*.go,*.js')")
 	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "E", []string{}, "Exclude files matching these patterns (e.g. '*.test.js')")
+	rootCmd.Flags().StringVarP(&profileName, "profile", "p", "default", "Profile to use when reading .flatten files")
 
 	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, ```, ~~~, `````, ~~~~~, ~~~~~~~~~~~)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "List all files that would be included without processing content")

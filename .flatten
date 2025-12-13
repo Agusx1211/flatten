@@ -1,0 +1,19 @@
+exclude:
+  - "bin/**"
+  - "build/**"
+
+profiles:
+  source:
+    exclude:
+      - "**/*_test.go"
+  source-and-tests:
+    include:
+      - "cmd/**"
+      - ".flatten"
+      - "README.md"
+      - "FLATTEN.md"
+      - "Dockerfile"
+      - "go.*"
+      - "Makefile"
+      - "build*.sh"
+      - "build.bat"
