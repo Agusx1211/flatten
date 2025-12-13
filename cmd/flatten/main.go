@@ -224,6 +224,9 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 			entry.Children = append(entry.Children, child)
 		}
 	}
+	if len(childFilter.includePatterns) > 0 && len(entry.Children) == 0 {
+		return nil, nil
+	}
 	return entry, nil
 }
 
@@ -273,6 +276,9 @@ func loadDirectoryDryRun(path string, filter *Filter) (*FileEntry, error) {
 		if child != nil {
 			entry.Children = append(entry.Children, child)
 		}
+	}
+	if len(childFilter.includePatterns) > 0 && len(entry.Children) == 0 {
+		return nil, nil
 	}
 	return entry, nil
 }
