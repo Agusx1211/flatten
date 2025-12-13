@@ -26,39 +26,6 @@ Collected on Linux (arm64) with Go `go1.25.5` by:
 - `cmd/flatten/main.go:611` (`composeFinalOutput`)
 - `README.md` (“Optional Output Wrapping” section)
 
-## 6) Non-dry-run output starts with a blank line
-
-**Symptoms**
-- `flatten .` prints an empty first line before `Total files: ...`.
-
-**Repro**
-- `flatten . | head -n 2`
-
-**Likely cause**
-- Header write starts with `\nTotal files: ...`.
-
-**Refs**
-- `cmd/flatten/main.go:895`
-
-## 7) Any read error aborts the whole run and prints full CLI usage
-
-**Symptoms**
-- A single unreadable file (permission denied) aborts the entire flatten.
-- The error output includes the full Cobra `Usage:` help text, which is noisy for runtime errors.
-
-**Repro**
-1. Create a directory with one readable file and one `chmod 000` file.
-2. Run: `flatten <dir>`
-3. Observed: exit code non-zero + error + full usage printed.
-
-**Likely cause**
-- `loadDirectory()` returns an error on first `os.ReadFile` failure.
-- Cobra default behavior prints usage on `RunE` error (no `SilenceUsage` set).
-
-**Refs**
-- `cmd/flatten/main.go:161` (hard error on `os.ReadFile`)
-- `cmd/flatten/main.go:796` (cobra command config)
-
 ## 8) `build.sh` uses `set -e` but also checks `$?` (failure branch won’t run)
 
 **Symptoms**

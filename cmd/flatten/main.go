@@ -25,14 +25,15 @@ var version = "dev"
 
 // FileEntry represents a file in the flattened structure
 type FileEntry struct {
-	Path     string
-	IsDir    bool
-	Size     int64
-	Mode     fs.FileMode
-	ModTime  int64
-	Content  []byte
-	Tokens   int
-	Children []*FileEntry
+	Path      string
+	IsDir     bool
+	Size      int64
+	Mode      fs.FileMode
+	ModTime   int64
+	Content   []byte
+	ReadError string
+	Tokens    int
+	Children  []*FileEntry
 }
 
 // FileHash is used for deduplication
@@ -173,7 +174,8 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 	if !info.IsDir() {
 		content, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read file %s: %w", path, err)
+			entry.ReadError = err.Error()
+			return entry, nil
 		}
 		entry.Content = content
 		if tokenizer != nil {
@@ -196,7 +198,8 @@ func loadDirectory(path string, filter *Filter, tokenizer *tiktoken.Tiktoken) (*
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %w", path, err)
+		entry.ReadError = err.Error()
+		return entry, nil
 	}
 	for _, item := range entries {
 		childPath := filepath.Join(path, item.Name())
@@ -298,6 +301,9 @@ func renderDirTree(entry *FileEntry, prefix string, isLast bool, showTokens bool
 		} else {
 			// This is a child, show only base name
 			name = filepath.Base(entry.Path)
+		}
+		if entry.ReadError != "" {
+			name = fmt.Sprintf("%s (unreadable)", name)
 		}
 		if showTokens {
 			name = fmt.Sprintf("%s (%d tokens)", name, entry.Tokens)
@@ -524,6 +530,23 @@ func printFlattenedOutput(entry *FileEntry, w *strings.Builder, fileHashes map[s
 			if err == nil {
 				w.WriteString(fmt.Sprintf("- symlink-target: %s\n", target))
 			}
+		}
+		if entry.ReadError != "" {
+			w.WriteString(fmt.Sprintf("- read-error: %s\n", entry.ReadError))
+			if showAllMetadata || showOwnership {
+				getOwnershipInfo(entry.Path, w)
+			}
+			if showAllMetadata || showChecksum {
+				w.WriteString("- sha256: (unavailable)\n")
+			}
+			if showTokens {
+				w.WriteString(fmt.Sprintf("- tokens: %d\n", entry.Tokens))
+			}
+			w.WriteString(fmt.Sprintf("- content:\n%s\n(unreadable: %s)\n%s\n", delimiter, entry.ReadError, delimiter))
+			if sections != nil {
+				*sections = append(*sections, OutputSection{Label: entry.Path, Start: start, End: w.Len()})
+			}
+			return
 		}
 		if showAllMetadata || showOwnership {
 			getOwnershipInfo(entry.Path, w)
@@ -820,8 +843,9 @@ var rootCmd = &cobra.Command{
 	Long: `Flatten takes one or more directories as input and outputs
 a flat representation of all their contents to stdout. It recursively processes
 subdirectories and their contents for each provided directory.`,
-	Version: version,
-	Args:    cobra.ArbitraryArgs,
+	Version:      version,
+	Args:         cobra.ArbitraryArgs,
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			args = []string{"."}
@@ -913,7 +937,7 @@ subdirectories and their contents for each provided directory.`,
 
 		// Write a single map for all directories
 		headerStart := output.Len()
-		output.WriteString(fmt.Sprintf("\nTotal files: %d\n", getTotalFiles(root)))
+		output.WriteString(fmt.Sprintf("Total files: %d\n", getTotalFiles(root)))
 		if showTotalSize {
 			output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
 		}
