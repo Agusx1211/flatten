@@ -78,6 +78,12 @@ var (
 	tcountDetailed bool
 	tcountModel    string
 
+	outputPrint      bool
+	outputCopy       bool
+	outputSSHCopy    bool
+	setDefaultOutput bool
+	silent           bool
+
 	includePatterns []string
 	excludePatterns []string
 	profileName     string
@@ -1579,10 +1585,29 @@ subdirectories and their contents for each provided directory.`,
 			return fmt.Errorf("--compress-level must be between 0 and 3")
 		}
 
-		if tcountDetailed {
-			tcount = true
+		defaultOutputMode := outputModePrint
+		if cfgMode, err := readHomeDefaultOutputMode(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		} else if cfgMode != "" {
+			defaultOutputMode = cfgMode
 		}
-		if tcount && dryRun {
+
+		mode, err := resolveOutputMode(defaultOutputMode, outputPrint, outputCopy, outputSSHCopy)
+		if err != nil {
+			return err
+		}
+
+		if setDefaultOutput {
+			if err := writeHomeDefaultOutputMode(mode); err != nil {
+				return err
+			}
+		}
+
+		autoTcountDetailed := (mode == outputModeCopy || mode == outputModeSSHCopy) && !silent && !dryRun
+		effectiveTcountDetailed := tcountDetailed || autoTcountDetailed
+		effectiveTcount := tcount || effectiveTcountDetailed
+
+		if effectiveTcount && dryRun {
 			return fmt.Errorf("--tcount/--tcount-detailed cannot be used with --dry-run")
 		}
 		if showTokens && dryRun {
@@ -1615,7 +1640,7 @@ subdirectories and their contents for each provided directory.`,
 		var output strings.Builder
 		var sections []OutputSection
 		sectionsPtr := (*[]OutputSection)(nil)
-		if tcountDetailed {
+		if effectiveTcountDetailed {
 			sectionsPtr = &sections
 		}
 
@@ -1673,6 +1698,12 @@ subdirectories and their contents for each provided directory.`,
 			root.Children = append(root.Children, dirEntry)
 		}
 
+		var outputStr string
+		var finalStr string
+		var legendStr string
+		var blobsStr string
+		var blobSections []OutputSection
+
 		if dryRun {
 			// Dry-run mode: just list the files that would be included
 			output.WriteString(fmt.Sprintf("Files that would be included in flatten output:\n\n"))
@@ -1683,535 +1714,318 @@ subdirectories and their contents for each provided directory.`,
 			output.WriteString(fmt.Sprintf("\nDirectory structure:\n%s\n", renderDirTreeForOutput(root, false)))
 			output.WriteString("Files:\n")
 			printDryRunOutput(root, &output)
-			printFinalOutput(output.String(), prefixMessage, suffixMessage)
-			return nil
-		}
-
-		if showTokens {
-			sumTokens(root)
-		}
-
-		// Write a single map for all directories
-		headerStart := output.Len()
-		output.WriteString(fmt.Sprintf("Total files: %d\n", getTotalFiles(root)))
-		if showTotalSize {
-			output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
-		}
-		output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTreeForOutput(root, showTokens)))
-		if sectionsPtr != nil {
-			*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[header]", Start: headerStart, End: output.Len()})
-		}
-
-		// If commands were requested, run them now so their outputs can be included
-		// in delimiter auto-detection and compression blob indexing while preserving
-		// the final print order below.
-		var cmdResults []CommandResult
-		if len(commands) > 0 {
-			cmdResults = runCommands(commands)
-		}
-
-		// Determine the markdown delimiter
-		delimiter := markdownDelimiter
-		if delimiter == "auto" {
-			delimiter = detectBestDelimiter(root, cmdResults)
-		}
-
-		fileHashes := make(map[string]*FileHash)
-
-		// Prepare compression context when enabled
-		var compCtx *CompressionContext
-		if effectiveCompressLevel > 0 {
-			var err error
-			compCtx, err = newCompressionContext(effectiveCompressLevel)
-			if err != nil {
-				return err
+			outputStr = output.String()
+			finalStr = outputStr
+		} else {
+			if showTokens {
+				sumTokens(root)
 			}
-			// build global index for large repeated blobs across files and command outputs
-			tempIdx := make(map[string]*BlobDef)
-			buildLargeBlobIndex(root, compCtx, tempIdx)
-			// include command outputs in the blob index
-			for _, r := range cmdResults {
-				stdoutStr, _ := applyLossyTransforms(r.Stdout, compCtx, compressionTextCommand, "")
-				for _, block := range extractLargeParagraphs(stdoutStr, compCtx.LargeBlobThresholdBytes) {
-					addBlobCandidate(tempIdx, block)
-				}
-				stderrStr, _ := applyLossyTransforms(r.Stderr, compCtx, compressionTextCommand, "")
-				for _, block := range extractLargeParagraphs(stderrStr, compCtx.LargeBlobThresholdBytes) {
-					addBlobCandidate(tempIdx, block)
-				}
-			}
-			minBytes := minNonZero(compCtx.LargeBlobThresholdBytes, compCtx.HeaderBlobMinBytes)
-			blobsByID, blobsByHash := finalizeBlobIDs(tempIdx, compCtx.BlobMinHits, minBytes)
-			blobIDs := make([]string, 0, len(blobsByID))
-			for id := range blobsByID {
-				blobIDs = append(blobIDs, id)
-			}
-			sort.Slice(blobIDs, func(i, j int) bool {
-				li := 0
-				lj := 0
-				if def := blobsByID[blobIDs[i]]; def != nil {
-					li = len(def.Content)
-				}
-				if def := blobsByID[blobIDs[j]]; def != nil {
-					lj = len(def.Content)
-				}
-				if li == lj {
-					return blobIDs[i] < blobIDs[j]
-				}
-				return li > lj
-			})
-			compCtx.BlobsByID = blobsByID
-			compCtx.BlobsByHash = blobsByHash
-			compCtx.BlobIDs = blobIDs
-		}
 
-		printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter, compCtx, sectionsPtr)
-
-		// If commands were requested, run them and append a detailed report
-		if len(commands) > 0 {
+			// Write a single map for all directories
+			headerStart := output.Len()
+			output.WriteString(fmt.Sprintf("Total files: %d\n", getTotalFiles(root)))
+			if showTotalSize {
+				output.WriteString(fmt.Sprintf("Total size: %d bytes\n", getTotalSize(root)))
+			}
+			output.WriteString(fmt.Sprintf("Directory structure:\n%s\n", renderDirTreeForOutput(root, showTokens)))
 			if sectionsPtr != nil {
-				start := output.Len()
-				output.WriteString("\nCommands execution:\n")
-				*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[commands]", Start: start, End: output.Len()})
-			} else {
-				output.WriteString("\nCommands execution:\n")
+				*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[header]", Start: headerStart, End: output.Len()})
 			}
-			for _, r := range cmdResults {
-				cmdStart := output.Len()
-				output.WriteString(fmt.Sprintf("\n- command: %s\n", r.Command))
-				output.WriteString(fmt.Sprintf("- started: %s\n", r.StartTime.Format(time.RFC3339Nano)))
-				output.WriteString(fmt.Sprintf("- finished: %s\n", r.EndTime.Format(time.RFC3339Nano)))
-				output.WriteString(fmt.Sprintf("- duration: %s\n", r.Duration))
-				output.WriteString(fmt.Sprintf("- exit-code: %d\n", r.ExitCode))
-				if r.Stdout != "" {
-					stdoutStr := r.Stdout
-					if compCtx != nil && compCtx.Enabled {
-						if transformed, changes := applyLossyTransforms(stdoutStr, compCtx, compressionTextCommand, ""); changes.Any {
-							stdoutStr = transformed
-							compCtx.Applied = true
-							if changes.Whitespace {
-								compCtx.AppliedWhitespace = true
-							}
-						}
-						if replaced, changed := replaceLargeBlobs(stdoutStr, compCtx); changed {
-							stdoutStr = replaced
-							compCtx.Applied = true
-							compCtx.AppliedBlobs = true
-						}
-						if compressed, changed := compressRepeatedBlocks(stdoutStr, compCtx.MaxRepeatGroupLines); changed {
-							stdoutStr = compressed
-							compCtx.Applied = true
-							compCtx.AppliedRepeats = true
-						}
-						if truncated, changed, outlined := maybeTruncateTextWithOutline(stdoutStr, compCtx, compressionTextCommand, ""); changed {
-							stdoutStr = truncated
-							compCtx.Applied = true
-							compCtx.AppliedTruncation = true
-							if outlined {
-								compCtx.AppliedOutline = true
-							}
-						}
-					}
-					if showLineNumbers {
-						stdoutStr = addLineNumbers(stdoutStr)
-					}
-					output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, stdoutStr, delimiter))
-				} else {
-					output.WriteString("- stdout: (empty)\n")
+
+			// If commands were requested, run them now so their outputs can be included
+			// in delimiter auto-detection and compression blob indexing while preserving
+			// the final print order below.
+			var cmdResults []CommandResult
+			if len(commands) > 0 {
+				cmdResults = runCommands(commands)
+			}
+
+			// Determine the markdown delimiter
+			delimiter := markdownDelimiter
+			if delimiter == "auto" {
+				delimiter = detectBestDelimiter(root, cmdResults)
+			}
+
+			fileHashes := make(map[string]*FileHash)
+
+			// Prepare compression context when enabled
+			var compCtx *CompressionContext
+			if effectiveCompressLevel > 0 {
+				var err error
+				compCtx, err = newCompressionContext(effectiveCompressLevel)
+				if err != nil {
+					return err
 				}
-				if r.Stderr != "" {
-					stderrStr := r.Stderr
-					if compCtx != nil && compCtx.Enabled {
-						if transformed, changes := applyLossyTransforms(stderrStr, compCtx, compressionTextCommand, ""); changes.Any {
-							stderrStr = transformed
-							compCtx.Applied = true
-							if changes.Whitespace {
-								compCtx.AppliedWhitespace = true
-							}
-						}
-						if replaced, changed := replaceLargeBlobs(stderrStr, compCtx); changed {
-							stderrStr = replaced
-							compCtx.Applied = true
-							compCtx.AppliedBlobs = true
-						}
-						if compressed, changed := compressRepeatedBlocks(stderrStr, compCtx.MaxRepeatGroupLines); changed {
-							stderrStr = compressed
-							compCtx.Applied = true
-							compCtx.AppliedRepeats = true
-						}
-						if truncated, changed, outlined := maybeTruncateTextWithOutline(stderrStr, compCtx, compressionTextCommand, ""); changed {
-							stderrStr = truncated
-							compCtx.Applied = true
-							compCtx.AppliedTruncation = true
-							if outlined {
-								compCtx.AppliedOutline = true
-							}
-						}
+				// build global index for large repeated blobs across files and command outputs
+				tempIdx := make(map[string]*BlobDef)
+				buildLargeBlobIndex(root, compCtx, tempIdx)
+				// include command outputs in the blob index
+				for _, r := range cmdResults {
+					stdoutStr, _ := applyLossyTransforms(r.Stdout, compCtx, compressionTextCommand, "")
+					for _, block := range extractLargeParagraphs(stdoutStr, compCtx.LargeBlobThresholdBytes) {
+						addBlobCandidate(tempIdx, block)
 					}
-					if showLineNumbers {
-						stderrStr = addLineNumbers(stderrStr)
+					stderrStr, _ := applyLossyTransforms(r.Stderr, compCtx, compressionTextCommand, "")
+					for _, block := range extractLargeParagraphs(stderrStr, compCtx.LargeBlobThresholdBytes) {
+						addBlobCandidate(tempIdx, block)
 					}
-					output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, stderrStr, delimiter))
-				} else {
-					output.WriteString("- stderr: (empty)\n")
 				}
+				minBytes := minNonZero(compCtx.LargeBlobThresholdBytes, compCtx.HeaderBlobMinBytes)
+				blobsByID, blobsByHash := finalizeBlobIDs(tempIdx, compCtx.BlobMinHits, minBytes)
+				blobIDs := make([]string, 0, len(blobsByID))
+				for id := range blobsByID {
+					blobIDs = append(blobIDs, id)
+				}
+				sort.Slice(blobIDs, func(i, j int) bool {
+					li := 0
+					lj := 0
+					if def := blobsByID[blobIDs[i]]; def != nil {
+						li = len(def.Content)
+					}
+					if def := blobsByID[blobIDs[j]]; def != nil {
+						lj = len(def.Content)
+					}
+					if li == lj {
+						return blobIDs[i] < blobIDs[j]
+					}
+					return li > lj
+				})
+				compCtx.BlobsByID = blobsByID
+				compCtx.BlobsByHash = blobsByHash
+				compCtx.BlobIDs = blobIDs
+			}
+
+			printFlattenedOutput(root, &output, fileHashes, showTokens, delimiter, compCtx, sectionsPtr)
+
+			// If commands were requested, run them and append a detailed report
+			if len(commands) > 0 {
 				if sectionsPtr != nil {
-					*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[command] " + r.Command, Start: cmdStart, End: output.Len()})
+					start := output.Len()
+					output.WriteString("\nCommands execution:\n")
+					*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[commands]", Start: start, End: output.Len()})
+				} else {
+					output.WriteString("\nCommands execution:\n")
 				}
-			}
-		}
-
-		// If compression applied, prepend a tiny legend and append extracted blobs
-		outputStr := output.String()
-		finalStr := outputStr
-		legendStr := ""
-		blobsStr := ""
-		var blobSections []OutputSection
-		if compCtx != nil && compCtx.Applied {
-			var legend strings.Builder
-			features := make([]string, 0, 6)
-			if compCtx.AppliedWhitespace {
-				features = append(features, "blank-lines")
-			}
-			if compCtx.AppliedComments {
-				features = append(features, "comments")
-			}
-			if compCtx.AppliedRepeats {
-				features = append(features, "repeats")
-			}
-			if compCtx.AppliedBlobs {
-				features = append(features, "blobs")
-			}
-			if compCtx.AppliedTruncation {
-				features = append(features, "truncation")
-			}
-			if compCtx.AppliedOutline {
-				features = append(features, "outline")
-			}
-			legend.WriteString(fmt.Sprintf("Compression: level %d (%s)\n\n", compCtx.Level, strings.Join(features, ", ")))
-			legendStr = legend.String()
-
-			// Append blobs section only for used IDs
-			var blobsSection strings.Builder
-			blobHeaderStart := blobsSection.Len()
-			blobsSection.WriteString("\nExtracted blobs:\n")
-			if sectionsPtr != nil {
-				blobSections = append(blobSections, OutputSection{Label: "[blobs]", Start: blobHeaderStart, End: blobsSection.Len()})
-			}
-			anyBlob := false
-			usedIDs := make([]string, 0, len(compCtx.UsedBlobIDs))
-			for id := range compCtx.UsedBlobIDs {
-				usedIDs = append(usedIDs, id)
-			}
-			sort.Slice(usedIDs, func(i, j int) bool {
-				li := 0
-				lj := 0
-				if def := compCtx.BlobsByID[usedIDs[i]]; def != nil {
-					li = len(def.Content)
-				}
-				if def := compCtx.BlobsByID[usedIDs[j]]; def != nil {
-					lj = len(def.Content)
-				}
-				if li == lj {
-					return usedIDs[i] < usedIDs[j]
-				}
-				return li > lj
-			})
-			for _, id := range usedIDs {
-				if def, ok := compCtx.BlobsByID[id]; ok {
-					anyBlob = true
-					blobStart := blobsSection.Len()
-					blobsSection.WriteString(fmt.Sprintf("\n- id: %s\n", id))
-					blobsSection.WriteString("- content:\n")
-					blobContent := def.Content
-					if compCtx.Level >= 3 {
-						if truncated, changed, outlined := maybeTruncateTextWithOutline(blobContent, compCtx, compressionTextFile, ""); changed {
-							blobContent = truncated
-							compCtx.AppliedTruncation = true
-							if outlined {
-								compCtx.AppliedOutline = true
+				for _, r := range cmdResults {
+					cmdStart := output.Len()
+					output.WriteString(fmt.Sprintf("\n- command: %s\n", r.Command))
+					output.WriteString(fmt.Sprintf("- started: %s\n", r.StartTime.Format(time.RFC3339Nano)))
+					output.WriteString(fmt.Sprintf("- finished: %s\n", r.EndTime.Format(time.RFC3339Nano)))
+					output.WriteString(fmt.Sprintf("- duration: %s\n", r.Duration))
+					output.WriteString(fmt.Sprintf("- exit-code: %d\n", r.ExitCode))
+					if r.Stdout != "" {
+						stdoutStr := r.Stdout
+						if compCtx != nil && compCtx.Enabled {
+							if transformed, changes := applyLossyTransforms(stdoutStr, compCtx, compressionTextCommand, ""); changes.Any {
+								stdoutStr = transformed
+								compCtx.Applied = true
+								if changes.Whitespace {
+									compCtx.AppliedWhitespace = true
+								}
+							}
+							if replaced, changed := replaceLargeBlobs(stdoutStr, compCtx); changed {
+								stdoutStr = replaced
+								compCtx.Applied = true
+								compCtx.AppliedBlobs = true
+							}
+							if compressed, changed := compressRepeatedBlocks(stdoutStr, compCtx.MaxRepeatGroupLines); changed {
+								stdoutStr = compressed
+								compCtx.Applied = true
+								compCtx.AppliedRepeats = true
+							}
+							if truncated, changed, outlined := maybeTruncateTextWithOutline(stdoutStr, compCtx, compressionTextCommand, ""); changed {
+								stdoutStr = truncated
+								compCtx.Applied = true
+								compCtx.AppliedTruncation = true
+								if outlined {
+									compCtx.AppliedOutline = true
+								}
 							}
 						}
+						if showLineNumbers {
+							stdoutStr = addLineNumbers(stdoutStr)
+						}
+						output.WriteString(fmt.Sprintf("- stdout:\n%s\n%s\n%s\n", delimiter, stdoutStr, delimiter))
+					} else {
+						output.WriteString("- stdout: (empty)\n")
 					}
-					blobsSection.WriteString(fmt.Sprintf("%s\n%s\n%s\n", delimiter, blobContent, delimiter))
+					if r.Stderr != "" {
+						stderrStr := r.Stderr
+						if compCtx != nil && compCtx.Enabled {
+							if transformed, changes := applyLossyTransforms(stderrStr, compCtx, compressionTextCommand, ""); changes.Any {
+								stderrStr = transformed
+								compCtx.Applied = true
+								if changes.Whitespace {
+									compCtx.AppliedWhitespace = true
+								}
+							}
+							if replaced, changed := replaceLargeBlobs(stderrStr, compCtx); changed {
+								stderrStr = replaced
+								compCtx.Applied = true
+								compCtx.AppliedBlobs = true
+							}
+							if compressed, changed := compressRepeatedBlocks(stderrStr, compCtx.MaxRepeatGroupLines); changed {
+								stderrStr = compressed
+								compCtx.Applied = true
+								compCtx.AppliedRepeats = true
+							}
+							if truncated, changed, outlined := maybeTruncateTextWithOutline(stderrStr, compCtx, compressionTextCommand, ""); changed {
+								stderrStr = truncated
+								compCtx.Applied = true
+								compCtx.AppliedTruncation = true
+								if outlined {
+									compCtx.AppliedOutline = true
+								}
+							}
+						}
+						if showLineNumbers {
+							stderrStr = addLineNumbers(stderrStr)
+						}
+						output.WriteString(fmt.Sprintf("- stderr:\n%s\n%s\n%s\n", delimiter, stderrStr, delimiter))
+					} else {
+						output.WriteString("- stderr: (empty)\n")
+					}
 					if sectionsPtr != nil {
-						blobSections = append(blobSections, OutputSection{Label: "[blob] " + id, Start: blobStart, End: blobsSection.Len()})
+						*sectionsPtr = append(*sectionsPtr, OutputSection{Label: "[command] " + r.Command, Start: cmdStart, End: output.Len()})
 					}
 				}
 			}
-			if anyBlob {
-				blobsStr = blobsSection.String()
-			} else {
-				blobsStr = ""
-				blobSections = nil
-			}
 
-			finalStr = legendStr + outputStr + blobsStr
+			// If compression applied, prepend a tiny legend and append extracted blobs
+			outputStr = output.String()
+			finalStr = outputStr
+			if compCtx != nil && compCtx.Applied {
+				var legend strings.Builder
+				features := make([]string, 0, 6)
+				if compCtx.AppliedWhitespace {
+					features = append(features, "blank-lines")
+				}
+				if compCtx.AppliedComments {
+					features = append(features, "comments")
+				}
+				if compCtx.AppliedRepeats {
+					features = append(features, "repeats")
+				}
+				if compCtx.AppliedBlobs {
+					features = append(features, "blobs")
+				}
+				if compCtx.AppliedTruncation {
+					features = append(features, "truncation")
+				}
+				if compCtx.AppliedOutline {
+					features = append(features, "outline")
+				}
+				legend.WriteString(fmt.Sprintf("Compression: level %d (%s)\n\n", compCtx.Level, strings.Join(features, ", ")))
+				legendStr = legend.String()
+
+				// Append blobs section only for used IDs
+				var blobsSection strings.Builder
+				blobHeaderStart := blobsSection.Len()
+				blobsSection.WriteString("\nExtracted blobs:\n")
+				if sectionsPtr != nil {
+					blobSections = append(blobSections, OutputSection{Label: "[blobs]", Start: blobHeaderStart, End: blobsSection.Len()})
+				}
+				anyBlob := false
+				usedIDs := make([]string, 0, len(compCtx.UsedBlobIDs))
+				for id := range compCtx.UsedBlobIDs {
+					usedIDs = append(usedIDs, id)
+				}
+				sort.Slice(usedIDs, func(i, j int) bool {
+					li := 0
+					lj := 0
+					if def := compCtx.BlobsByID[usedIDs[i]]; def != nil {
+						li = len(def.Content)
+					}
+					if def := compCtx.BlobsByID[usedIDs[j]]; def != nil {
+						lj = len(def.Content)
+					}
+					if li == lj {
+						return usedIDs[i] < usedIDs[j]
+					}
+					return li > lj
+				})
+				for _, id := range usedIDs {
+					if def, ok := compCtx.BlobsByID[id]; ok {
+						anyBlob = true
+						blobStart := blobsSection.Len()
+						blobsSection.WriteString(fmt.Sprintf("\n- id: %s\n", id))
+						blobsSection.WriteString("- content:\n")
+						blobContent := def.Content
+						if compCtx.Level >= 3 {
+							if truncated, changed, outlined := maybeTruncateTextWithOutline(blobContent, compCtx, compressionTextFile, ""); changed {
+								blobContent = truncated
+								compCtx.AppliedTruncation = true
+								if outlined {
+									compCtx.AppliedOutline = true
+								}
+							}
+						}
+						blobsSection.WriteString(fmt.Sprintf("%s\n%s\n%s\n", delimiter, blobContent, delimiter))
+						if sectionsPtr != nil {
+							blobSections = append(blobSections, OutputSection{Label: "[blob] " + id, Start: blobStart, End: blobsSection.Len()})
+						}
+					}
+				}
+				if anyBlob {
+					blobsStr = blobsSection.String()
+				} else {
+					blobsStr = ""
+					blobSections = nil
+				}
+
+				finalStr = legendStr + outputStr + blobsStr
+			}
 		}
 
-		if tcount {
+		needsPrintedOutput := mode != outputModePrint || effectiveTcount
+		printed := ""
+		if needsPrintedOutput {
+			printed = composeFinalOutput(finalStr, prefixMessage, suffixMessage)
+		}
+
+		tokenReport := ""
+		if effectiveTcount {
 			model := tokensModel
 			if strings.TrimSpace(tcountModel) != "" {
 				model = tcountModel
 			}
-			tkm, err := tiktoken.EncodingForModel(model)
+			sectionsEnabled := sectionsPtr != nil
+			report, err := buildTokenReport(printed, model, effectiveTcountDetailed, sections, sectionsEnabled, legendStr, outputStr, blobsStr, blobSections, root, prefixMessage, suffixMessage)
 			if err != nil {
-				return fmt.Errorf("failed to get tokenizer for model %q: %w", model, err)
+				return err
 			}
-
-			printed := composeFinalOutput(finalStr, prefixMessage, suffixMessage)
-			tokens := tkm.Encode(printed, nil, nil)
-			totalTokens := len(tokens)
-
-			fmt.Println(totalTokens)
-			if !tcountDetailed {
-				return nil
-			}
-
-			// Build sections for the fully printed output so we can attribute tokens.
-			if sectionsPtr == nil {
-				return fmt.Errorf("internal error: expected sections to be enabled for --tcount-detailed")
-			}
-
-			contentSections := sections
-			if legendStr != "" {
-				legendLen := len(legendStr)
-				for i := range contentSections {
-					contentSections[i].Start += legendLen
-					contentSections[i].End += legendLen
-				}
-				contentSections = append([]OutputSection{{Label: "[legend]", Start: 0, End: legendLen}}, contentSections...)
-			}
-			if blobsStr != "" && len(blobSections) > 0 {
-				shift := len(legendStr) + len(outputStr)
-				for _, s := range blobSections {
-					contentSections = append(contentSections, OutputSection{Label: s.Label, Start: s.Start + shift, End: s.End + shift})
-				}
-			}
-
-			hasPrefix := strings.TrimSpace(prefixMessage) != ""
-			hasSuffix := strings.TrimSpace(suffixMessage) != ""
-			wrapper := "---\n"
-
-			finalSections := make([]OutputSection, 0, len(contentSections)+4)
-			offset := 0
-			if hasPrefix {
-				p := prefixMessage + "\n"
-				finalSections = append(finalSections, OutputSection{Label: "[prefix]", Start: offset, End: offset + len(p)})
-				offset += len(p)
-			}
-			if hasPrefix || hasSuffix {
-				finalSections = append(finalSections, OutputSection{Label: "[wrapper]", Start: offset, End: offset + len(wrapper)})
-				offset += len(wrapper)
-			}
-			for _, s := range contentSections {
-				finalSections = append(finalSections, OutputSection{Label: s.Label, Start: s.Start + offset, End: s.End + offset})
-			}
-			offset += len(finalStr)
-			if hasPrefix || hasSuffix {
-				finalSections = append(finalSections, OutputSection{Label: "[wrapper]", Start: offset, End: offset + len(wrapper)})
-				offset += len(wrapper)
-			}
-			if hasSuffix {
-				s := suffixMessage + "\n"
-				finalSections = append(finalSections, OutputSection{Label: "[suffix]", Start: offset, End: offset + len(s)})
-				offset += len(s)
-			}
-
-			if offset != len(printed) {
-				// Keep going; token counts will be best-effort.
-			}
-
-			finalSections = fillSectionGaps(finalSections, len(printed))
-			totalTokens, countsByLabel := tokenCountsBySection(tkm, tokens, finalSections)
-
-			filePaths := make(map[string]bool)
-			dirPaths := make(map[string]bool)
-			collectNodePaths(root, filePaths, dirPaths)
-
-			subtreeTokens := make(map[string]int, len(filePaths)+len(dirPaths))
-			subtreeFiles := make(map[string]int, len(filePaths)+len(dirPaths))
-			computeSubtreeTokenStats(root, countsByLabel, subtreeTokens, subtreeFiles)
-
-			pathTokens := subtreeTokens[root.Path]
-			nonPathTokens := totalTokens - pathTokens
-
-			fmt.Printf("\nmodel: %s\n", model)
-			fmt.Printf("path tokens: %d\n", pathTokens)
-			fmt.Printf("non-path tokens: %d\n", nonPathTokens)
-
-			type item struct {
-				Label  string
-				Path   string
-				Tokens int
-				Files  int
-				IsDir  bool
-			}
-
-			sortItems := func(items []item) {
-				sort.Slice(items, func(i, j int) bool {
-					if items[i].Tokens == items[j].Tokens {
-						return items[i].Label < items[j].Label
-					}
-					return items[i].Tokens > items[j].Tokens
-				})
-			}
-
-			const maxTopLevelLines = 20
-			topLevel := make([]item, 0, len(root.Children))
-			for _, child := range root.Children {
-				tok := subtreeTokens[child.Path]
-				if tok == 0 {
-					continue
-				}
-				label := child.Path
-				if child.IsDir {
-					label = formatDirPathForReport(child.Path)
-				}
-				topLevel = append(topLevel, item{
-					Label:  label,
-					Path:   child.Path,
-					Tokens: tok,
-					Files:  subtreeFiles[child.Path],
-					IsDir:  child.IsDir,
-				})
-			}
-			sortItems(topLevel)
-
-			fmt.Printf("\ntop-level (by path tokens):\n")
-			topLevelLimit := maxTopLevelLines
-			if len(topLevel) < topLevelLimit {
-				topLevelLimit = len(topLevel)
-			}
-			for i := 0; i < topLevelLimit; i++ {
-				if topLevel[i].IsDir {
-					fmt.Printf("%d\t%s\t(%s, %d files)\n", topLevel[i].Tokens, topLevel[i].Label, formatPercent(topLevel[i].Tokens, pathTokens), topLevel[i].Files)
-					continue
-				}
-				fmt.Printf("%d\t%s\t(%s)\n", topLevel[i].Tokens, topLevel[i].Label, formatPercent(topLevel[i].Tokens, pathTokens))
-			}
-			if len(topLevel) > topLevelLimit {
-				fmt.Printf("...\n")
-			}
-
-			fmt.Printf("\ndominant path:\n")
-			current := root
-			for depth := 0; depth < 8; depth++ {
-				var best *FileEntry
-				bestTokens := 0
-				for _, child := range current.Children {
-					tok := subtreeTokens[child.Path]
-					if tok > bestTokens {
-						bestTokens = tok
-						best = child
-					}
-				}
-				if best == nil || bestTokens == 0 {
-					break
-				}
-				label := best.Path
-				if best.IsDir {
-					label = formatDirPathForReport(best.Path)
-					fmt.Printf("%d\t%s\t(%s, %d files)\n", bestTokens, label, formatPercent(bestTokens, pathTokens), subtreeFiles[best.Path])
-					current = best
-					continue
-				}
-				fmt.Printf("%d\t%s\t(%s)\n", bestTokens, label, formatPercent(bestTokens, pathTokens))
-				break
-			}
-
-			const maxDirLines = 20
-			dirs := make([]item, 0, len(dirPaths))
-			for dir := range dirPaths {
-				if dir == root.Path {
-					continue
-				}
-				tok := subtreeTokens[dir]
-				if tok == 0 {
-					continue
-				}
-				dirs = append(dirs, item{
-					Label:  formatDirPathForReport(dir),
-					Path:   dir,
-					Tokens: tok,
-					Files:  subtreeFiles[dir],
-					IsDir:  true,
-				})
-			}
-			sortItems(dirs)
-
-			fmt.Printf("\ntop directories (subtree):\n")
-			dirLimit := maxDirLines
-			if len(dirs) < dirLimit {
-				dirLimit = len(dirs)
-			}
-			for i := 0; i < dirLimit; i++ {
-				fmt.Printf("%d\t%s\t(%s, %d files)\n", dirs[i].Tokens, dirs[i].Label, formatPercent(dirs[i].Tokens, pathTokens), dirs[i].Files)
-			}
-			if len(dirs) > dirLimit {
-				fmt.Printf("...\n")
-			}
-
-			const maxFileLines = 20
-			files := make([]item, 0, len(filePaths))
-			for fp := range filePaths {
-				tok := subtreeTokens[fp]
-				if tok == 0 {
-					continue
-				}
-				files = append(files, item{
-					Label:  fp,
-					Path:   fp,
-					Tokens: tok,
-					Files:  1,
-					IsDir:  false,
-				})
-			}
-			sortItems(files)
-
-			fmt.Printf("\ntop files:\n")
-			fileLimit := maxFileLines
-			if len(files) < fileLimit {
-				fileLimit = len(files)
-			}
-			for i := 0; i < fileLimit; i++ {
-				fmt.Printf("%d\t%s\t(%s)\n", files[i].Tokens, files[i].Label, formatPercent(files[i].Tokens, pathTokens))
-			}
-			if len(files) > fileLimit {
-				fmt.Printf("...\n")
-			}
-
-			const maxOtherLines = 15
-			others := make([]item, 0, len(countsByLabel))
-			for label, n := range countsByLabel {
-				if n == 0 {
-					continue
-				}
-				if filePaths[label] || dirPaths[label] {
-					continue
-				}
-				others = append(others, item{Label: label, Path: label, Tokens: n})
-			}
-			sortItems(others)
-
-			if len(others) > 0 {
-				fmt.Printf("\nother sections:\n")
-				otherLimit := maxOtherLines
-				if len(others) < otherLimit {
-					otherLimit = len(others)
-				}
-				for i := 0; i < otherLimit; i++ {
-					fmt.Printf("%d\t%s\n", others[i].Tokens, others[i].Label)
-				}
-				if len(others) > otherLimit {
-					fmt.Printf("...\n")
-				}
-			}
-			return nil
+			tokenReport = report
 		}
 
-		printFinalOutput(finalStr, prefixMessage, suffixMessage)
-		return nil
+		switch mode {
+		case outputModePrint:
+			if effectiveTcount {
+				if !silent {
+					fmt.Print(tokenReport)
+				}
+				return nil
+			}
+			printFinalOutput(finalStr, prefixMessage, suffixMessage)
+			return nil
+		case outputModeCopy:
+			if err := copyToClipboard(printed); err != nil {
+				return err
+			}
+			if effectiveTcount && !silent {
+				fmt.Print(tokenReport)
+			}
+			return nil
+		case outputModeSSHCopy:
+			if err := copyToOSC52(printed); err != nil {
+				return err
+			}
+			if effectiveTcount && !silent {
+				fmt.Print(tokenReport)
+			}
+			return nil
+		default:
+			return fmt.Errorf("unknown output mode %q", mode)
+		}
 	},
 }
 
@@ -2247,6 +2061,12 @@ func init() {
 
 	rootCmd.Flags().StringVar(&markdownDelimiter, "markdown-delimiter", "auto", "Markdown code block delimiter (auto, <3 backticks>, ~~~, <5 backticks>, ~~~~~, ~~~~~~~~~~~)")
 	rootCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "List all files that would be included without processing content")
+
+	rootCmd.Flags().BoolVar(&outputPrint, "print", false, "Print output to stdout (default)")
+	rootCmd.Flags().BoolVar(&outputCopy, "copy", false, "Copy output to the system clipboard")
+	rootCmd.Flags().BoolVar(&outputSSHCopy, "ssh-copy", false, "Copy output to the terminal clipboard over SSH using osc52")
+	rootCmd.Flags().BoolVar(&silent, "silent", false, "Suppress token report output (useful with --copy/--ssh-copy)")
+	rootCmd.Flags().BoolVar(&setDefaultOutput, "set-default", false, "Persist the selected output mode to ~/.flatten")
 
 	// Output compression flag (disabled by default)
 	rootCmd.Flags().BoolVar(&compressOutput, "compress", false, "Compress output by collapsing repeats and extracting large repeated blobs")

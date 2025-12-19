@@ -105,6 +105,7 @@ Usage:
 Flags:
   -a, --all-metadata                Show all metadata
       --command stringArray         Command to run after flattening (can be repeated)
+      --copy                        Copy output to the system clipboard
       --compress                    Compress output by collapsing repeats and extracting large repeated blobs
       --compress-level int          Compression level (0=off, 1=default, 2=more, 3=most aggressive)
   -d, --dry-run                     List all files that would be included without processing content
@@ -119,8 +120,12 @@ Flags:
       --line-numbers                Include line numbers in file and command output content
       --markdown-delimiter string   Markdown code block delimiter (auto, <3 backticks>, ~~~, <5 backticks>, ~~~~~, ~~~~~~~~~~~) (default "auto")
       --no-dedup                    Disable file deduplication
+      --print                       Print output to stdout (default)
       --prefix string               Optional message printed before output, wrapped by --- lines
   -p, --profile string              Profile to use when reading .flatten files (default "default")
+      --set-default                 Persist the selected output mode to ~/.flatten
+      --silent                      Suppress token report output (useful with --copy/--ssh-copy)
+      --ssh-copy                    Copy output to the terminal clipboard over SSH using OSC 52
   -c, --show-checksum               Show SHA256 checksum of files
   -M, --show-mime                   Show file MIME types
   -m, --show-mode                   Show file permissions
@@ -164,6 +169,15 @@ Start of snapshot
 ---
 End of snapshot
 ```
+
+### Output Modes
+- `--print` (default): write the flattened output to stdout.
+- `--copy`: copy the full output to the system clipboard.
+- `--ssh-copy`: copy the full output via OSC 52.
+
+When using `--copy` or `--ssh-copy`, `--tcount-detailed` is printed to stdout automatically unless `--silent` is set.
+
+To persist a default output mode, run `flatten --copy --set-default` (or `--ssh-copy` / `--print`). This stores `output: copy` in `~/.flatten`.
 
 ### Token Counting
 If you want to estimate how many tokens the *full output* would be for an OpenAI model (without actually printing it), use:
