@@ -1603,7 +1603,17 @@ subdirectories and their contents for each provided directory.`,
 			}
 		}
 
-		autoTcountDetailed := (mode == outputModeCopy || mode == outputModeSSHCopy) && !silent && !dryRun
+		// Only auto-enable detailed tcount when in clipboard mode AND user didn't explicitly request simple --tcount
+		explicitTcount := cmd.Flags().Changed("tcount")
+		explicitOutputMode := cmd.Flags().Changed("print") || cmd.Flags().Changed("copy") || cmd.Flags().Changed("ssh-copy")
+
+		// When --tcount is explicitly requested but no output mode is explicitly set,
+		// treat it as print mode (user just wants to see the count, not copy to clipboard)
+		if explicitTcount && !explicitOutputMode {
+			mode = outputModePrint
+		}
+
+		autoTcountDetailed := (mode == outputModeCopy || mode == outputModeSSHCopy) && !silent && !dryRun && !explicitTcount
 		effectiveTcountDetailed := tcountDetailed || autoTcountDetailed
 		effectiveTcount := tcount || effectiveTcountDetailed
 
