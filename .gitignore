@@ -52,7 +52,7 @@ ehthumbs.db
 Thumbs.db
 
 # Flatten binary
-./flatten
+/flatten
 
 # Temporary files
 *.tmp

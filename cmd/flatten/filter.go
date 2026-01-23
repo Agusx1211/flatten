@@ -47,8 +47,12 @@ func NewFilter(
 	excludePatterns []string,
 	profile string,
 ) (*Filter, error) {
-	compiledIncludes := compilePatterns(includePatterns)
-	compiledExcludes := compilePatterns(excludePatterns)
+	// Adjust patterns to be relative to the base directory
+	adjustedIncludes := adjustPatternsToBaseDir(includePatterns, dir)
+	adjustedExcludes := adjustPatternsToBaseDir(excludePatterns, dir)
+
+	compiledIncludes := compilePatterns(adjustedIncludes)
+	compiledExcludes := compilePatterns(adjustedExcludes)
 
 	f := &Filter{
 		includeAll:         includeGitIgnore,
@@ -406,6 +410,100 @@ func compilePatterns(patterns []string) []globPattern {
 		result = append(result, pat)
 	}
 	return result
+}
+
+// adjustPatternsToBaseDir converts patterns that look like file paths to be
+// relative to the base directory. This handles the common case where users specify
+// -E ./path/to/file when flattening a subdirectory.
+func adjustPatternsToBaseDir(patterns []string, baseDir string) []string {
+	if len(patterns) == 0 {
+		return patterns
+	}
+
+	// Get absolute path of base directory for comparison
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return patterns // Can't resolve base dir, return patterns as-is
+	}
+	absBaseDir = filepath.Clean(absBaseDir)
+
+	result := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		adjusted := adjustSinglePattern(pattern, absBaseDir)
+		result = append(result, adjusted)
+	}
+	return result
+}
+
+// adjustSinglePattern adjusts a single pattern to be relative to the base directory
+// if it looks like a file path.
+func adjustSinglePattern(pattern string, absBaseDir string) string {
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return pattern
+	}
+
+	// Preserve trailing slash for directory-only patterns
+	hasTrailingSlash := strings.HasSuffix(trimmed, "/") || strings.HasSuffix(trimmed, "\\")
+
+	// Check if pattern looks like a path (starts with ./ or ../ or /)
+	looksLikePath := strings.HasPrefix(trimmed, "./") ||
+		strings.HasPrefix(trimmed, "../") ||
+		strings.HasPrefix(trimmed, ".\\") ||
+		strings.HasPrefix(trimmed, "..\\") ||
+		filepath.IsAbs(trimmed)
+
+	// Also check if the pattern (without wildcards) exists as a file
+	// This handles cases like "src/file.ts" where it's a real path
+	patternWithoutGlob := trimmed
+	if idx := strings.IndexAny(patternWithoutGlob, "*?["); idx >= 0 {
+		patternWithoutGlob = patternWithoutGlob[:idx]
+	}
+	patternWithoutGlob = strings.TrimSuffix(patternWithoutGlob, "/")
+
+	if !looksLikePath && patternWithoutGlob != "" {
+		// Check if the pattern prefix exists as a file or directory
+		if _, err := os.Stat(patternWithoutGlob); err == nil {
+			looksLikePath = true
+		}
+	}
+
+	if !looksLikePath {
+		return pattern // Not a path-like pattern, keep as-is
+	}
+
+	// Try to resolve the pattern as a path relative to CWD
+	absPattern, err := filepath.Abs(trimmed)
+	if err != nil {
+		return pattern
+	}
+	absPattern = filepath.Clean(absPattern)
+
+	// Check if the pattern path is under the base directory
+	if !strings.HasPrefix(absPattern, absBaseDir) {
+		return pattern // Pattern is outside base dir, keep as-is
+	}
+
+	// Make pattern relative to base directory
+	relPattern, err := filepath.Rel(absBaseDir, absPattern)
+	if err != nil {
+		return pattern
+	}
+
+	// Don't allow patterns that escape the base directory
+	if strings.HasPrefix(relPattern, "..") {
+		return pattern
+	}
+
+	// Normalize to forward slashes
+	relPattern = filepath.ToSlash(relPattern)
+
+	// Restore trailing slash if it was present
+	if hasTrailingSlash && !strings.HasSuffix(relPattern, "/") {
+		relPattern += "/"
+	}
+
+	return relPattern
 }
 
 func normalizePattern(raw string) globPattern {
