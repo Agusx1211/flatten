@@ -125,7 +125,7 @@ Flags:
   -p, --profile string              Profile to use when reading .flatten files (default "default")
       --set-default                 Persist the selected output mode to ~/.flatten
       --silent                      Suppress token report output (useful with --copy/--ssh-copy)
-      --ssh-copy                    Copy output to the terminal clipboard over SSH using OSC 52
+      --ssh-copy                    Copy output to the terminal clipboard over SSH using OSC 52 (prefers code-server clipboard when available)
   -c, --show-checksum               Show SHA256 checksum of files
   -M, --show-mime                   Show file MIME types
   -m, --show-mode                   Show file permissions
@@ -173,7 +173,7 @@ End of snapshot
 ### Output Modes
 - `--print` (default): write the flattened output to stdout.
 - `--copy`: copy the full output to the system clipboard.
-- `--ssh-copy`: copy the full output via OSC 52.
+- `--ssh-copy`: copy the full output via OSC 52 (prefers code-server clipboard when available).
 
 When using `--copy` or `--ssh-copy`, `--tcount-detailed` is printed to stdout automatically unless `--silent` is set.
 

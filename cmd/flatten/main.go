@@ -2074,7 +2074,7 @@ func init() {
 
 	rootCmd.Flags().BoolVar(&outputPrint, "print", false, "Print output to stdout (default)")
 	rootCmd.Flags().BoolVar(&outputCopy, "copy", false, "Copy output to the system clipboard")
-	rootCmd.Flags().BoolVar(&outputSSHCopy, "ssh-copy", false, "Copy output to the terminal clipboard over SSH using osc52")
+	rootCmd.Flags().BoolVar(&outputSSHCopy, "ssh-copy", false, "Copy output to the terminal clipboard over SSH using osc52 (prefers code-server clipboard when available)")
 	rootCmd.Flags().BoolVar(&silent, "silent", false, "Suppress token report output (useful with --copy/--ssh-copy)")
 	rootCmd.Flags().BoolVar(&setDefaultOutput, "set-default", false, "Persist the selected output mode to ~/.flatten")
 
